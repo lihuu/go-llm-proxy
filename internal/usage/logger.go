@@ -28,18 +28,20 @@ type UsageLogger struct {
 
 // UsageRecord holds the metrics for a single proxied request.
 type UsageRecord struct {
-	Timestamp     time.Time
-	KeyHash       string // first 16 hex chars of SHA-256(key)
-	KeyName       string
-	Model         string
-	Endpoint      string
-	StatusCode    int
-	RequestBytes  int64
-	ResponseBytes int64
-	InputTokens   int
-	OutputTokens  int
-	TotalTokens   int
-	DurationMS    int64
+	Timestamp       time.Time
+	KeyHash         string // first 16 hex chars of SHA-256(key)
+	KeyName         string
+	Model           string
+	Endpoint        string
+	StatusCode      int
+	RequestBytes    int64
+	ResponseBytes   int64
+	InputTokens     int
+	OutputTokens    int
+	TotalTokens     int
+	CacheReadTokens  int
+	CacheWriteTokens int
+	DurationMS      int64
 }
 
 const schema = `
@@ -53,10 +55,12 @@ CREATE TABLE IF NOT EXISTS usage (
 	status_code   INTEGER NOT NULL DEFAULT 0,
 	request_bytes INTEGER NOT NULL DEFAULT 0,
 	response_bytes INTEGER NOT NULL DEFAULT 0,
-	input_tokens  INTEGER NOT NULL DEFAULT 0,
-	output_tokens INTEGER NOT NULL DEFAULT 0,
-	total_tokens  INTEGER NOT NULL DEFAULT 0,
-	duration_ms   INTEGER NOT NULL DEFAULT 0
+	input_tokens       INTEGER NOT NULL DEFAULT 0,
+	output_tokens      INTEGER NOT NULL DEFAULT 0,
+	total_tokens       INTEGER NOT NULL DEFAULT 0,
+	cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+	cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+	duration_ms        INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage(timestamp);
@@ -75,6 +79,13 @@ func NewUsageLogger(dbPath string) (*UsageLogger, error) {
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("creating usage schema: %w", err)
+	}
+
+	// Migrate: add cache columns for databases created before v0.3.10.
+	for _, col := range []string{"cache_read_tokens", "cache_write_tokens"} {
+		if _, err := db.Exec("ALTER TABLE usage ADD COLUMN " + col + " INTEGER NOT NULL DEFAULT 0"); err != nil {
+			// Column already exists — this is expected on new databases.
+		}
 	}
 
 	readDB, err := sql.Open("sqlite", dbPath+"?mode=ro&_journal_mode=WAL&_busy_timeout=5000")
@@ -96,8 +107,9 @@ func (ul *UsageLogger) Log(rec UsageRecord) {
 	_, err := ul.db.Exec(`
 		INSERT INTO usage (timestamp, key_hash, key_name, model, endpoint,
 			status_code, request_bytes, response_bytes,
-			input_tokens, output_tokens, total_tokens, duration_ms)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			input_tokens, output_tokens, total_tokens,
+			cache_read_tokens, cache_write_tokens, duration_ms)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rec.Timestamp.UTC().Format(time.RFC3339),
 		rec.KeyHash,
 		rec.KeyName,
@@ -109,6 +121,8 @@ func (ul *UsageLogger) Log(rec UsageRecord) {
 		rec.InputTokens,
 		rec.OutputTokens,
 		rec.TotalTokens,
+		rec.CacheReadTokens,
+		rec.CacheWriteTokens,
 		rec.DurationMS,
 	)
 	if err != nil {
@@ -135,41 +149,61 @@ type DashboardData struct {
 }
 
 type DashboardTotals struct {
-	Requests    int     `json:"requests"`
-	TotalTokens int64   `json:"total_tokens"`
-	Users       int     `json:"users"`
-	ErrorRate   float64 `json:"error_rate"`
+	Requests         int     `json:"requests"`
+	TotalTokens      int64   `json:"total_tokens"`
+	InputTokens      int64   `json:"input_tokens"`
+	OutputTokens     int64   `json:"output_tokens"`
+	CacheReadTokens  int64   `json:"cache_read_tokens"`
+	CacheWriteTokens int64   `json:"cache_write_tokens"`
+	Users            int     `json:"users"`
+	ErrorRate        float64 `json:"error_rate"`
 }
 
 type DailyRow struct {
-	Date        string `json:"date"`
-	Requests    int    `json:"requests"`
-	TotalTokens int64  `json:"total_tokens"`
-	Errors      int    `json:"errors"`
+	Date             string `json:"date"`
+	Requests         int    `json:"requests"`
+	TotalTokens      int64  `json:"total_tokens"`
+	InputTokens      int64  `json:"input_tokens"`
+	OutputTokens     int64  `json:"output_tokens"`
+	CacheReadTokens  int64  `json:"cache_read_tokens"`
+	CacheWriteTokens int64  `json:"cache_write_tokens"`
+	Errors           int    `json:"errors"`
 }
 
 type DailyModelRow struct {
-	Date        string `json:"date"`
-	Model       string `json:"model"`
-	Requests    int    `json:"requests"`
-	TotalTokens int64  `json:"total_tokens"`
+	Date             string `json:"date"`
+	Model            string `json:"model"`
+	Requests         int    `json:"requests"`
+	TotalTokens      int64  `json:"total_tokens"`
+	InputTokens      int64  `json:"input_tokens"`
+	OutputTokens     int64  `json:"output_tokens"`
+	CacheReadTokens  int64  `json:"cache_read_tokens"`
+	CacheWriteTokens int64  `json:"cache_write_tokens"`
 }
 
 type UserRow struct {
-	Name        string `json:"name"`
-	KeyHash     string `json:"key_hash"`
-	Requests    int    `json:"requests"`
-	TotalTokens int64  `json:"total_tokens"`
-	ActiveDays  int    `json:"active_days"`
-	LastSeen    string `json:"last_seen"`
+	Name             string `json:"name"`
+	KeyHash          string `json:"key_hash"`
+	Requests         int    `json:"requests"`
+	TotalTokens      int64  `json:"total_tokens"`
+	InputTokens      int64  `json:"input_tokens"`
+	OutputTokens     int64  `json:"output_tokens"`
+	CacheReadTokens  int64  `json:"cache_read_tokens"`
+	CacheWriteTokens int64  `json:"cache_write_tokens"`
+	ActiveDays       int    `json:"active_days"`
+	LastSeen         string `json:"last_seen"`
 }
 
 type ModelRow struct {
-	Model       string  `json:"model"`
-	Requests    int     `json:"requests"`
-	Users       int     `json:"users"`
-	TotalTokens int64   `json:"total_tokens"`
-	AvgLatency  float64 `json:"avg_latency_ms"`
+	Model            string  `json:"model"`
+	Requests         int     `json:"requests"`
+	Users            int     `json:"users"`
+	TotalTokens      int64   `json:"total_tokens"`
+	InputTokens      int64   `json:"input_tokens"`
+	OutputTokens     int64   `json:"output_tokens"`
+	CacheReadTokens  int64   `json:"cache_read_tokens"`
+	CacheWriteTokens int64   `json:"cache_write_tokens"`
+	AvgLatency       float64 `json:"avg_latency_ms"`
 }
 
 func (ul *UsageLogger) QueryDashboardData(days int) (*DashboardData, error) {
@@ -184,11 +218,18 @@ func (ul *UsageLogger) QueryDashboardData(days int) (*DashboardData, error) {
 		SELECT
 			COUNT(*),
 			COALESCE(SUM(total_tokens), 0),
+			COALESCE(SUM(input_tokens), 0),
+			COALESCE(SUM(output_tokens), 0),
+			COALESCE(SUM(cache_read_tokens), 0),
+			COALESCE(SUM(cache_write_tokens), 0),
 			COUNT(DISTINCT key_hash),
 			CAST(COALESCE(100.0 * SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 0) AS REAL)
 		FROM usage
 		WHERE timestamp >= date('now', ?)
-	`, periodArg).Scan(&data.Totals.Requests, &data.Totals.TotalTokens, &data.Totals.Users, &data.Totals.ErrorRate)
+	`, periodArg).Scan(&data.Totals.Requests, &data.Totals.TotalTokens,
+		&data.Totals.InputTokens, &data.Totals.OutputTokens,
+		&data.Totals.CacheReadTokens, &data.Totals.CacheWriteTokens,
+		&data.Totals.Users, &data.Totals.ErrorRate)
 	if err != nil {
 		return nil, fmt.Errorf("totals query: %w", err)
 	}
@@ -198,6 +239,10 @@ func (ul *UsageLogger) QueryDashboardData(days int) (*DashboardData, error) {
 			date(timestamp) AS day,
 			COUNT(*)        AS requests,
 			COALESCE(SUM(total_tokens), 0),
+			COALESCE(SUM(input_tokens), 0),
+			COALESCE(SUM(output_tokens), 0),
+			COALESCE(SUM(cache_read_tokens), 0),
+			COALESCE(SUM(cache_write_tokens), 0),
 			SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS errors
 		FROM usage
 		WHERE timestamp >= date('now', ?)
@@ -209,7 +254,9 @@ func (ul *UsageLogger) QueryDashboardData(days int) (*DashboardData, error) {
 	}
 	for rows.Next() {
 		var r DailyRow
-		if err := rows.Scan(&r.Date, &r.Requests, &r.TotalTokens, &r.Errors); err != nil {
+		if err := rows.Scan(&r.Date, &r.Requests, &r.TotalTokens,
+			&r.InputTokens, &r.OutputTokens,
+			&r.CacheReadTokens, &r.CacheWriteTokens, &r.Errors); err != nil {
 			continue
 		}
 		data.Daily = append(data.Daily, r)
@@ -222,6 +269,10 @@ func (ul *UsageLogger) QueryDashboardData(days int) (*DashboardData, error) {
 			key_hash,
 			COUNT(*)        AS requests,
 			COALESCE(SUM(total_tokens), 0),
+			COALESCE(SUM(input_tokens), 0),
+			COALESCE(SUM(output_tokens), 0),
+			COALESCE(SUM(cache_read_tokens), 0),
+			COALESCE(SUM(cache_write_tokens), 0),
 			COUNT(DISTINCT date(timestamp)) AS active_days,
 			MAX(timestamp)  AS last_seen
 		FROM usage
@@ -235,7 +286,10 @@ func (ul *UsageLogger) QueryDashboardData(days int) (*DashboardData, error) {
 	for userRows.Next() {
 		var r UserRow
 		var lastSeen string
-		if err := userRows.Scan(&r.Name, &r.KeyHash, &r.Requests, &r.TotalTokens, &r.ActiveDays, &lastSeen); err != nil {
+		if err := userRows.Scan(&r.Name, &r.KeyHash, &r.Requests, &r.TotalTokens,
+			&r.InputTokens, &r.OutputTokens,
+			&r.CacheReadTokens, &r.CacheWriteTokens,
+			&r.ActiveDays, &lastSeen); err != nil {
 			continue
 		}
 		if r.Name == "" {
@@ -259,6 +313,10 @@ func (ul *UsageLogger) QueryDashboardData(days int) (*DashboardData, error) {
 			COUNT(*)        AS requests,
 			COUNT(DISTINCT key_hash) AS unique_users,
 			COALESCE(SUM(total_tokens), 0),
+			COALESCE(SUM(input_tokens), 0),
+			COALESCE(SUM(output_tokens), 0),
+			COALESCE(SUM(cache_read_tokens), 0),
+			COALESCE(SUM(cache_write_tokens), 0),
 			CAST(AVG(duration_ms) AS REAL) AS avg_duration_ms
 		FROM usage
 		WHERE timestamp >= date('now', ?)
@@ -270,7 +328,10 @@ func (ul *UsageLogger) QueryDashboardData(days int) (*DashboardData, error) {
 	}
 	for modelRows.Next() {
 		var r ModelRow
-		if err := modelRows.Scan(&r.Model, &r.Requests, &r.Users, &r.TotalTokens, &r.AvgLatency); err != nil {
+		if err := modelRows.Scan(&r.Model, &r.Requests, &r.Users, &r.TotalTokens,
+			&r.InputTokens, &r.OutputTokens,
+			&r.CacheReadTokens, &r.CacheWriteTokens,
+			&r.AvgLatency); err != nil {
 			continue
 		}
 		data.Models = append(data.Models, r)
@@ -282,7 +343,11 @@ func (ul *UsageLogger) QueryDashboardData(days int) (*DashboardData, error) {
 			date(timestamp) AS day,
 			model,
 			COUNT(*)        AS requests,
-			COALESCE(SUM(total_tokens), 0)
+			COALESCE(SUM(total_tokens), 0),
+			COALESCE(SUM(input_tokens), 0),
+			COALESCE(SUM(output_tokens), 0),
+			COALESCE(SUM(cache_read_tokens), 0),
+			COALESCE(SUM(cache_write_tokens), 0)
 		FROM usage
 		WHERE timestamp >= date('now', ?)
 		GROUP BY day, model
@@ -293,7 +358,9 @@ func (ul *UsageLogger) QueryDashboardData(days int) (*DashboardData, error) {
 	}
 	for dailyModelRows.Next() {
 		var r DailyModelRow
-		if err := dailyModelRows.Scan(&r.Date, &r.Model, &r.Requests, &r.TotalTokens); err != nil {
+		if err := dailyModelRows.Scan(&r.Date, &r.Model, &r.Requests, &r.TotalTokens,
+			&r.InputTokens, &r.OutputTokens,
+			&r.CacheReadTokens, &r.CacheWriteTokens); err != nil {
 			continue
 		}
 		data.DailyModels = append(data.DailyModels, r)
@@ -314,9 +381,11 @@ func HashKey(key string) string {
 
 // TokenUsage holds token counts extracted from an upstream response.
 type TokenUsage struct {
-	InputTokens  int
-	OutputTokens int
-	TotalTokens  int
+	InputTokens      int
+	OutputTokens     int
+	TotalTokens      int
+	CacheReadTokens  int
+	CacheWriteTokens int
 }
 
 // ExtractTokenUsage attempts to extract token counts from a response body.
@@ -339,22 +408,31 @@ func extractTokensFromJSON(body []byte, backendType string) TokenUsage {
 
 // extractOpenAITokens parses the "usage" object from an OpenAI-format response.
 //
-//	{"usage": {"prompt_tokens": N, "completion_tokens": N, "total_tokens": N}}
+//	{"usage": {"prompt_tokens": N, "completion_tokens": N, "total_tokens": N,
+//	  "prompt_tokens_details": {"cached_tokens": N}}}
 func extractOpenAITokens(body []byte) TokenUsage {
 	var resp struct {
 		Usage struct {
 			PromptTokens     int `json:"prompt_tokens"`
 			CompletionTokens int `json:"completion_tokens"`
 			TotalTokens      int `json:"total_tokens"`
+			PromptTokensDetails *struct {
+				CachedTokens int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal(body, &resp) != nil {
 		return TokenUsage{}
 	}
+	cached := 0
+	if resp.Usage.PromptTokensDetails != nil {
+		cached = resp.Usage.PromptTokensDetails.CachedTokens
+	}
 	return TokenUsage{
-		InputTokens:  resp.Usage.PromptTokens,
-		OutputTokens: resp.Usage.CompletionTokens,
-		TotalTokens:  resp.Usage.TotalTokens,
+		InputTokens:     resp.Usage.PromptTokens,
+		OutputTokens:    resp.Usage.CompletionTokens,
+		TotalTokens:     resp.Usage.TotalTokens,
+		CacheReadTokens: cached,
 	}
 }
 
@@ -376,9 +454,11 @@ func extractAnthropicTokens(body []byte) TokenUsage {
 	total := resp.Usage.InputTokens + resp.Usage.OutputTokens +
 		resp.Usage.CacheCreationInputTokens + resp.Usage.CacheReadInputTokens
 	return TokenUsage{
-		InputTokens:  resp.Usage.InputTokens + resp.Usage.CacheCreationInputTokens + resp.Usage.CacheReadInputTokens,
-		OutputTokens: resp.Usage.OutputTokens,
-		TotalTokens:  total,
+		InputTokens:      resp.Usage.InputTokens,
+		OutputTokens:     resp.Usage.OutputTokens,
+		TotalTokens:      total,
+		CacheReadTokens:  resp.Usage.CacheReadInputTokens,
+		CacheWriteTokens: resp.Usage.CacheCreationInputTokens,
 	}
 }
 
@@ -438,7 +518,7 @@ func extractAnthropicSSETokens(body []byte) TokenUsage {
 
 		switch currentEvent {
 		case "message_start":
-			// {"type":"message_start","message":{"usage":{"input_tokens":N}}}
+			// {"type":"message_start","message":{"usage":{"input_tokens":N,"cache_creation_input_tokens":N,"cache_read_input_tokens":N}}}
 			var msg struct {
 				Message struct {
 					Usage struct {
@@ -449,9 +529,9 @@ func extractAnthropicSSETokens(body []byte) TokenUsage {
 				} `json:"message"`
 			}
 			if json.Unmarshal(data, &msg) == nil {
-				usage.InputTokens = msg.Message.Usage.InputTokens +
-					msg.Message.Usage.CacheCreationInputTokens +
-					msg.Message.Usage.CacheReadInputTokens
+				usage.InputTokens = msg.Message.Usage.InputTokens
+				usage.CacheReadTokens = msg.Message.Usage.CacheReadInputTokens
+				usage.CacheWriteTokens = msg.Message.Usage.CacheCreationInputTokens
 			}
 
 		case "message_delta":
@@ -467,6 +547,6 @@ func extractAnthropicSSETokens(body []byte) TokenUsage {
 		}
 	}
 
-	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	usage.TotalTokens = usage.InputTokens + usage.OutputTokens + usage.CacheReadTokens + usage.CacheWriteTokens
 	return usage
 }

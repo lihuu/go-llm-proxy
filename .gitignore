@@ -12,3 +12,4 @@ qwen-code-main/
 opencode-dev/
 rtx6kpro/
 .gitignore
+usage.db

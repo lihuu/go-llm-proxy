@@ -771,9 +771,13 @@ func (h *ResponsesHandler) handleStreaming(w http.ResponseWriter, resp *http.Res
 
 		var usageObj any
 		if usageData != nil {
+			inputDetails := map[string]any{"cached_tokens": 0}
+			if usageData.PromptTokensDetails != nil {
+				inputDetails["cached_tokens"] = usageData.PromptTokensDetails.CachedTokens
+			}
 			usageObj = map[string]any{
 				"input_tokens":          usageData.PromptTokens,
-				"input_tokens_details":  nil,
+				"input_tokens_details":  inputDetails,
 				"output_tokens":         usageData.CompletionTokens,
 				"output_tokens_details": nil,
 				"total_tokens":          usageData.TotalTokens,

@@ -24,14 +24,35 @@ type Config struct {
 	Listen                 string           `yaml:"listen"`
 	Models                 []ModelConfig    `yaml:"models"`
 	Keys                   []KeyConfig      `yaml:"keys"`
-	Services               ServicesConfig   `yaml:"services"`                 // external service proxies (Qdrant, etc.)
-	Processors             ProcessorsConfig `yaml:"processors"`               // global processor defaults
-	TrustedProxies         []string         `yaml:"trusted_proxies"`          // CIDR or IPs allowed to set X-Real-IP
+	Providers              []ProviderConfig `yaml:"providers"`              // named provider definitions (shared backend/api_key)
+	Services               ServicesConfig   `yaml:"services"`               // external service proxies (Qdrant, etc.)
+	Processors             ProcessorsConfig `yaml:"processors"`             // global processor defaults
+	TrustedProxies         []string         `yaml:"trusted_proxies"`        // CIDR or IPs allowed to set X-Real-IP
 	ServeConfigGenerator   bool             `yaml:"serve_config_generator"`   // enable the config generator page at GET /
 	LogMetrics             bool             `yaml:"log_metrics"`              // enable per-request usage logging to SQLite
 	UsageDB                string           `yaml:"usage_db"`                 // path to SQLite usage database (default: usage.db)
 	UsageDashboard         bool             `yaml:"usage_dashboard"`          // enable the usage dashboard at /usage
 	UsageDashboardPassword string           `yaml:"usage_dashboard_password"` // password for the usage dashboard
+}
+
+// ProviderConfig defines a named provider that can be referenced by models
+// via the provider field. A model inherits the provider's backend, api_key,
+// type, and other connection-level settings, and can override any of them.
+type ProviderConfig struct {
+	Name   string `yaml:"name"`
+	Backend string `yaml:"backend"`
+	APIKey string `yaml:"api_key"`
+	Type   string `yaml:"type"` // "", "openai" (default), "anthropic", or "bedrock"
+	AuthType string `yaml:"auth_type"` // "auto" (default), "bearer", or "x-api-key"
+
+	// AWS Bedrock fields (only used when type: "bedrock").
+	Region          string `yaml:"region"`
+	AWSAccessKey    string `yaml:"aws_access_key"`
+	AWSSecretKey    string `yaml:"aws_secret_key"`
+	AWSSessionToken string `yaml:"aws_session_token"`
+	GuardrailID      string `yaml:"guardrail_id,omitempty"`
+	GuardrailVersion string `yaml:"guardrail_version,omitempty"`
+	GuardrailTrace   string `yaml:"guardrail_trace,omitempty"`
 }
 
 const (
@@ -63,11 +84,13 @@ type SamplingDefaults struct {
 
 type ModelConfig struct {
 	Name           string            `yaml:"name"`
-	Backend        string            `yaml:"backend"`         // upstream URL e.g. http://192.168.100.10:8000/v1
-	APIKey         string            `yaml:"api_key"`         // key to send to the backend (if required)
+	Provider       string            `yaml:"provider"`        // reference to a named provider (shares backend/api_key/type)
+	Backend        string            `yaml:"backend"`         // upstream URL e.g. http://192.168.100.10:8000/v1 (overrides provider)
+	APIKey         string            `yaml:"api_key"`         // key to send to the backend (overrides provider)
 	Model          string            `yaml:"model"`           // model name to send to the backend (if different from Name)
 	Timeout        int               `yaml:"timeout"`         // request timeout in seconds (default 300)
-	Type           string            `yaml:"type"`            // backend type: "" or "openai" (default), "anthropic"
+	Type           string            `yaml:"type"`            // backend type: "" or "openai" (default), "anthropic" (overrides provider)
+	AuthType       string            `yaml:"auth_type"`       // "auto" (default), "bearer", or "x-api-key" (overrides provider)
 	ResponsesMode  string            `yaml:"responses_mode"`  // "auto" (default), "native", or "translate"
 	MessagesMode   string            `yaml:"messages_mode"`   // "auto" (default), "native", or "translate"
 	ContextWindow  int               `yaml:"context_window"`  // max context tokens (0 = auto-detect from backend)
@@ -164,6 +187,47 @@ func (cs *ConfigStore) Load() error {
 		if m.Model == "" {
 			m.Model = m.Name
 		}
+
+		// Resolve provider reference: inherit backend/api_key/type from the
+		// named provider, and Bedrock-specific fields when applicable.
+		if m.Provider != "" {
+			var p *ProviderConfig
+			for j := range cfg.Providers {
+				if cfg.Providers[j].Name == m.Provider {
+					p = &cfg.Providers[j]
+					break
+				}
+			}
+			if p == nil {
+				return fmt.Errorf("model %q references unknown provider %q", m.Name, m.Provider)
+			}
+			if m.Backend == "" {
+				m.Backend = p.Backend
+			}
+			if m.APIKey == "" {
+				m.APIKey = p.APIKey
+			}
+			if m.Type == "" {
+				m.Type = p.Type
+			}
+			if m.AuthType == "" {
+				m.AuthType = p.AuthType
+			}
+			// Inherit Bedrock fields from provider when model doesn't set them.
+			if m.Region == "" {
+				m.Region = p.Region
+			}
+			if m.AWSAccessKey == "" {
+				m.AWSAccessKey = p.AWSAccessKey
+			}
+			if m.AWSSecretKey == "" {
+				m.AWSSecretKey = p.AWSSecretKey
+			}
+			if m.AWSSessionToken == "" {
+				m.AWSSessionToken = p.AWSSessionToken
+			}
+		}
+
 		if m.Type == BackendBedrock {
 			applyBedrockDefaults(m)
 		}
@@ -279,8 +343,18 @@ func applyBedrockDefaults(m *ModelConfig) {
 	}
 }
 
-// FindModel returns the ModelConfig with the given name, or nil if not found.
-func FindModel(cfg *Config, name string) *ModelConfig {
+// FindModel returns the ModelConfig matching the given name and optional type hint.
+// When typeHint is non-empty, it first tries an exact (name, type) match, then
+// falls back to name-only lookup. This allows models with the same name but
+// different types (e.g. "ds-flash" for both openai and anthropic backends).
+func FindModel(cfg *Config, name string, typeHint ...string) *ModelConfig {
+	if len(typeHint) > 0 && typeHint[0] != "" {
+		for i := range cfg.Models {
+			if cfg.Models[i].Name == name && cfg.Models[i].Type == typeHint[0] {
+				return &cfg.Models[i]
+			}
+		}
+	}
 	for i := range cfg.Models {
 		if cfg.Models[i].Name == name {
 			return &cfg.Models[i]
@@ -303,7 +377,7 @@ func validateConfig(cfg *Config) error {
 		}
 	}
 
-	names := make(map[string]bool)
+	seen := make(map[string]bool) // "name:type" uniqueness
 	for _, m := range cfg.Models {
 		if m.Name == "" {
 			return fmt.Errorf("model entry missing name")
@@ -375,29 +449,37 @@ func validateConfig(cfg *Config) error {
 			}
 		}
 
-		if names[m.Name] {
-			return fmt.Errorf("duplicate model name %q", m.Name)
+		key := m.Name + ":" + m.Type
+		if seen[key] {
+			return fmt.Errorf("duplicate model %q with type %q", m.Name, m.Type)
 		}
-		names[m.Name] = true
+		seen[key] = true
+	}
+
+	// Build a name-only set for processor reference checks (processors reference
+	// models by name, not by name+type).
+	allNames := make(map[string]bool)
+	for _, m := range cfg.Models {
+		allNames[m.Name] = true
 	}
 
 	// Validate global vision processor references a defined model.
 	if v := cfg.Processors.Vision; v != "" {
-		if !names[v] {
+		if !allNames[v] {
 			return fmt.Errorf("global processors.vision references unknown model %q", v)
 		}
 	}
 
 	// Validate global OCR processor references a defined model.
 	if v := cfg.Processors.OCR; v != "" && v != "none" {
-		if !names[v] {
+		if !allNames[v] {
 			return fmt.Errorf("global processors.ocr references unknown model %q", v)
 		}
 	}
 
 	// Validate global audio processor references a defined model.
 	if v := cfg.Processors.Audio; v != "" && v != "none" {
-		if !names[v] {
+		if !allNames[v] {
 			return fmt.Errorf("global processors.audio references unknown model %q", v)
 		}
 	}
@@ -405,12 +487,12 @@ func validateConfig(cfg *Config) error {
 	// Validate per-model processor overrides reference defined models.
 	for _, m := range cfg.Models {
 		if m.Processors != nil && m.Processors.Vision != "" && m.Processors.Vision != "none" {
-			if !names[m.Processors.Vision] {
+			if !allNames[m.Processors.Vision] {
 				return fmt.Errorf("model %q processors.vision references unknown model %q", m.Name, m.Processors.Vision)
 			}
 		}
 		if m.Processors != nil && m.Processors.OCR != "" && m.Processors.OCR != "none" {
-			if !names[m.Processors.OCR] {
+			if !allNames[m.Processors.OCR] {
 				return fmt.Errorf("model %q processors.ocr references unknown model %q", m.Name, m.Processors.OCR)
 			}
 		}
@@ -454,7 +536,7 @@ func validateConfig(cfg *Config) error {
 		keys[k.Key] = true
 
 		for _, m := range k.Models {
-			if !names[m] {
+			if !allNames[m] {
 				return fmt.Errorf("key %q references unknown model %q", k.Name, m)
 			}
 		}

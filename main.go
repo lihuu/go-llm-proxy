@@ -172,7 +172,7 @@ func main() {
 		mux.Handle("GET /usage/data", http.HandlerFunc(dash.ServeData))
 		slog.Info("usage dashboard enabled at /usage")
 
-		admin := handler.NewAdminHandler(cs, dashRl, healthStore)
+		admin := handler.NewAdminHandler(cs, dashRl, healthStore, ul)
 		mux.Handle("GET /admin", http.HandlerFunc(admin.Root))
 		mux.Handle("GET /admin/", http.HandlerFunc(admin.Root))
 		mux.Handle("GET /admin/login", http.HandlerFunc(admin.LoginPage))
@@ -187,6 +187,8 @@ func main() {
 		mux.Handle("GET /admin/processors", admin.RequirePage(admin.ProcessorsPage))
 		mux.Handle("GET /admin/processors/data", admin.RequireAPI(admin.ProcessorsData))
 		mux.Handle("POST /admin/processors/mutate", admin.RequireAPI(admin.ProcessorsMutate))
+		mux.Handle("GET /admin/usage", admin.RequirePage(admin.UsagePage))
+		mux.Handle("GET /admin/usage/data", admin.RequireAPI(admin.UsageData))
 		slog.Info("admin page enabled at /admin")
 	}
 	mux.Handle("GET /v1/models", ratelimit.RateLimitMiddleware(rl, auth.AuthMiddleware(cs, models)))

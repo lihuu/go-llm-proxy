@@ -68,6 +68,25 @@ func copyHeaders(dst, src http.Header, backendType string) {
 	}
 }
 
+// setAuthHeader sets the Authorization header on an upstream request based on
+// the model's auth_type and backend type. auth_type can be "bearer", "x-api-key",
+// or "" (auto-detect from backend type).
+func setAuthHeader(h http.Header, apiKey, authType, backendType string) {
+	switch authType {
+	case "bearer":
+		h.Set("Authorization", "Bearer "+apiKey)
+	case "x-api-key":
+		h.Set("X-Api-Key", apiKey)
+	default:
+		// Auto-detect: anthropic backends use X-Api-Key, others use Bearer.
+		if backendType == config.BackendAnthropic {
+			h.Set("X-Api-Key", apiKey)
+		} else {
+			h.Set("Authorization", "Bearer "+apiKey)
+		}
+	}
+}
+
 // sendChatCompletionsRequest sends a non-streaming Chat Completions request to a
 // model's backend and returns the parsed response. Used by the search tool loop
 // in both Messages and Responses handlers.
@@ -96,7 +115,7 @@ func sendChatCompletionsRequest(ctx context.Context, client *http.Client, chatRe
 	}
 	upReq.Header.Set("Content-Type", "application/json")
 	if model.APIKey != "" {
-		upReq.Header.Set("Authorization", "Bearer "+model.APIKey)
+		setAuthHeader(upReq.Header, model.APIKey, model.AuthType, model.Type)
 	}
 
 	resp, err := client.Do(upReq)

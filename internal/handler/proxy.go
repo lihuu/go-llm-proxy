@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"go-llm-proxy/internal/api"
@@ -97,7 +98,20 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	model := config.FindModel(cfg, modelName)
+	// Infer type hint from request path for model lookup.
+	// /v1/messages → anthropic, /v1/chat/completions → openai
+	typeHint := ""
+	if requireAnthropic || strings.Contains(cleanPath, "/v1/messages") {
+		typeHint = config.BackendAnthropic
+	} else {
+		typeHint = config.BackendOpenAI
+	}
+
+	model := config.FindModel(cfg, modelName, typeHint)
+	if model == nil {
+		// Fallback: try without type hint (backward compat).
+		model = config.FindModel(cfg, modelName)
+	}
 	if model == nil {
 		httputil.WriteError(w, http.StatusNotFound, "unknown model")
 		return
@@ -105,6 +119,14 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if requireAnthropic && model.Type != config.BackendAnthropic {
 		httputil.WriteError(w, http.StatusBadRequest, "model is not an anthropic backend")
+		return
+	}
+
+	// OpenAI protocol endpoints cannot serve anthropic-type models.
+	// Anthropic protocol requests to openai-type models are handled by the
+	// MessagesHandler (which translates them automatically).
+	if !requireAnthropic && !strings.Contains(cleanPath, "/v1/messages") && model.Type == config.BackendAnthropic {
+		httputil.WriteError(w, http.StatusBadRequest, "anthropic-type models are only accessible via /v1/messages")
 		return
 	}
 
@@ -190,8 +212,14 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Build the upstream URL.
+	// For Anthropic backends, keep the full /v1/... path only if the backend
+	// URL doesn't already end with /v1 (e.g. https://ollama.com/v1).
 	relPath := cleanPath
-	if model.Type != config.BackendAnthropic {
+	if model.Type == config.BackendAnthropic {
+		if strings.HasSuffix(strings.TrimRight(model.Backend, "/"), "/v1") {
+			relPath = strings.TrimPrefix(cleanPath, "/v1")
+		}
+	} else {
 		relPath = strings.TrimPrefix(cleanPath, "/v1")
 	}
 	upstreamURL := strings.TrimRight(model.Backend, "/") + relPath
@@ -208,11 +236,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	copyHeaders(upReq.Header, r.Header, model.Type)
 
 	if model.APIKey != "" {
-		if model.Type == config.BackendAnthropic {
-			upReq.Header.Set("X-Api-Key", model.APIKey)
-		} else {
-			upReq.Header.Set("Authorization", "Bearer "+model.APIKey)
-		}
+		setAuthHeader(upReq.Header, model.APIKey, model.AuthType, model.Type)
 	}
 
 	keyName := ""
@@ -272,8 +296,12 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// For Chat Completions (without search), filter <think> tags from content.
 	if isChatCompletions && isStreaming {
-		usageData := streamChatWithThinkFilter(w, resp)
-		logUsageFromChatResponse(p.usage, usageData, rc, 0)
+		if rc.model.Type == config.BackendAnthropic {
+			usageData := streamChatWithThinkFilter(w, resp)
+			logUsageFromChatResponse(p.usage, usageData, rc, 0)
+		} else {
+			p.streamRawResponse(w, resp, rc, true)
+		}
 		return
 	}
 	if isChatCompletions && !isStreaming {
@@ -309,19 +337,59 @@ func (p *ProxyHandler) streamRawResponse(w http.ResponseWriter, resp *http.Respo
 
 	flusher, canFlush := w.(http.Flusher)
 	buf := make([]byte, 4096)
-	var totalBytes int64
-	capture := newCaptureBuffer(isStreaming)
+	var totalBytes atomic.Int64
+
+	// Usage recording runs in a background goroutine so the main loop
+	// is never blocked by capture or token extraction.
+	var capture *captureBuffer
+	var captureCh chan []byte
+	if p.usage != nil {
+		capture = newCaptureBuffer(isStreaming)
+		captureCh = make(chan []byte, 64)
+		go func() {
+			for b := range captureCh {
+				capture.write(b)
+			}
+			var tokens usage.TokenUsage
+			if body := capture.bytes(); body != nil {
+				tokens = usage.ExtractTokenUsage(body, rc.model.Type, isStreaming)
+			}
+			p.usage.Log(usage.UsageRecord{
+				Timestamp:       rc.startTime,
+				KeyHash:         rc.keyHash,
+				KeyName:         rc.keyName,
+				Model:           rc.modelName,
+				Endpoint:        rc.endpoint,
+				StatusCode:      resp.StatusCode,
+				RequestBytes:    int64(len(rc.requestBody)),
+				ResponseBytes:   totalBytes.Load(),
+				InputTokens:     tokens.InputTokens,
+				OutputTokens:    tokens.OutputTokens,
+				TotalTokens:     tokens.TotalTokens,
+				CacheReadTokens:  tokens.CacheReadTokens,
+				CacheWriteTokens: tokens.CacheWriteTokens,
+				DurationMS:      time.Since(rc.startTime).Milliseconds(),
+			})
+		}()
+	}
+
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
-			totalBytes += int64(n)
-			if totalBytes > api.MaxResponseBodySize {
-				slog.Error("upstream response exceeded size limit", "model", rc.modelName, "bytes", totalBytes)
-				capture.discard()
+			totalBytes.Add(int64(n))
+			if totalBytes.Load() > api.MaxResponseBodySize {
+				slog.Error("upstream response exceeded size limit", "model", rc.modelName, "bytes", totalBytes.Load())
+				if capture != nil {
+					capture.discard()
+				}
 				break
 			}
-			if p.usage != nil {
-				capture.write(buf[:n])
+			if captureCh != nil {
+				select {
+				case captureCh <- append([]byte(nil), buf[:n]...):
+				default:
+					// Channel full; skip capture to avoid blocking the stream.
+				}
 			}
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
 				break
@@ -335,26 +403,8 @@ func (p *ProxyHandler) streamRawResponse(w http.ResponseWriter, resp *http.Respo
 		}
 	}
 
-	if p.usage != nil {
-		var tokens usage.TokenUsage
-		if body := capture.bytes(); body != nil {
-			tokens = usage.ExtractTokenUsage(body, rc.model.Type, isStreaming)
-		}
-		rec := usage.UsageRecord{
-			Timestamp:     rc.startTime,
-			KeyHash:       rc.keyHash,
-			KeyName:       rc.keyName,
-			Model:         rc.modelName,
-			Endpoint:      rc.endpoint,
-			StatusCode:    resp.StatusCode,
-			RequestBytes:  int64(len(rc.requestBody)),
-			ResponseBytes: totalBytes,
-			InputTokens:   tokens.InputTokens,
-			OutputTokens:  tokens.OutputTokens,
-			TotalTokens:   tokens.TotalTokens,
-			DurationMS:    time.Since(rc.startTime).Milliseconds(),
-		}
-		go p.usage.Log(rec)
+	if captureCh != nil {
+		close(captureCh)
 	}
 }
 
@@ -410,6 +460,33 @@ func (p *ProxyHandler) handleNonStreamingChatWithFilter(w http.ResponseWriter, r
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, api.MaxResponseBodySize))
 	if err != nil {
 		httputil.WriteError(w, http.StatusBadGateway, "failed to read upstream response")
+		return
+	}
+
+	// Fast path: no think tags in response, pass through unchanged.
+	if !bytes.Contains(respBody, []byte("thinking")) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(respBody)
+
+		if p.usage != nil {
+			tokens := usage.ExtractTokenUsage(respBody, rc.model.Type, false)
+			logUsageChat(p.usage, usageLogInput{
+				startTime:     rc.startTime,
+				statusCode:    http.StatusOK,
+				keyName:       rc.keyName,
+				keyHash:       rc.keyHash,
+				model:         rc.modelName,
+				endpoint:      rc.endpoint,
+				requestBytes:  int64(len(rc.requestBody)),
+				responseBytes: int64(len(respBody)),
+				inputTokens:   tokens.InputTokens,
+				outputTokens:  tokens.OutputTokens,
+				totalTokens:   tokens.TotalTokens,
+				cacheReadTokens:  tokens.CacheReadTokens,
+				cacheWriteTokens: tokens.CacheWriteTokens,
+			}, nil)
+		}
 		return
 	}
 

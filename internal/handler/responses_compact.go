@@ -57,7 +57,10 @@ func (h *ResponsesHandler) HandleCompact(w http.ResponseWriter, r *http.Request)
 		httputil.WriteError(w, http.StatusForbidden, "not authorized for requested model")
 		return
 	}
-	model := config.FindModel(cfg, req.Model)
+	model := config.FindModel(cfg, req.Model, config.BackendOpenAI)
+	if model == nil {
+		model = config.FindModel(cfg, req.Model)
+	}
 	if model == nil {
 		httputil.WriteError(w, http.StatusNotFound, "unknown model")
 		return
@@ -129,7 +132,7 @@ func (h *ResponsesHandler) HandleCompact(w http.ResponseWriter, r *http.Request)
 	}
 	upReq.Header.Set("Content-Type", "application/json")
 	if model.APIKey != "" {
-		upReq.Header.Set("Authorization", "Bearer "+model.APIKey)
+		setAuthHeader(upReq.Header, model.APIKey, model.AuthType, model.Type)
 	}
 
 	resp, err := h.client.Do(upReq)

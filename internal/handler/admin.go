@@ -10,6 +10,7 @@ import (
 	"go-llm-proxy/internal/config"
 	"go-llm-proxy/internal/httputil"
 	"go-llm-proxy/internal/ratelimit"
+	"go-llm-proxy/internal/usage"
 )
 
 const adminCookieName = "admin_auth"
@@ -21,11 +22,12 @@ type AdminHandler struct {
 	cs       *config.ConfigStore
 	rl       *ratelimit.RateLimiter
 	health   *config.HealthStore
+	ul       *usage.UsageLogger
 	sessions *sessionStore
 }
 
-func NewAdminHandler(cs *config.ConfigStore, rl *ratelimit.RateLimiter, hs *config.HealthStore) *AdminHandler {
-	return &AdminHandler{cs: cs, rl: rl, health: hs, sessions: newSessionStore()}
+func NewAdminHandler(cs *config.ConfigStore, rl *ratelimit.RateLimiter, hs *config.HealthStore, ul *usage.UsageLogger) *AdminHandler {
+	return &AdminHandler{cs: cs, rl: rl, health: hs, ul: ul, sessions: newSessionStore()}
 }
 
 // Root redirects /admin → /admin/users.
@@ -248,7 +250,7 @@ func (h *AdminHandler) renderShell(w http.ResponseWriter, activeTab, title, body
 <div class="header">
   <div class="header-inner">
     <h1>Admin</h1>
-    <nav class="admin-nav">`+tab("users", "Users", "/admin/users")+tab("models", "Models", "/admin/models")+tab("processors", "Processors", "/admin/processors")+`</nav>
+    <nav class="admin-nav">`+tab("users", "Users", "/admin/users")+tab("models", "Models", "/admin/models")+tab("processors", "Processors", "/admin/processors")+tab("usage", "Usage", "/admin/usage")+`</nav>
     <form method="POST" action="/admin/logout" style="margin-left:auto">
       <button class="btn-logout" type="submit">Sign out</button>
     </form>

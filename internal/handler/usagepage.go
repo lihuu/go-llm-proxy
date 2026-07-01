@@ -199,14 +199,14 @@ func (h *UsageDashboardHandler) renderDashboard(w http.ResponseWriter) {
 <div class="card">
 <h2>Users</h2>
 <div class="table-wrap"><table class="data-table">
-<thead><tr><th>Name</th><th>Key</th><th>Requests</th><th>Tokens</th><th>Active Days</th><th>Last Seen</th></tr></thead>
+<thead><tr><th>Name</th><th>Key</th><th>Requests</th><th>Tokens</th><th>Input</th><th>Output</th><th>Cache R</th><th>Cache W</th><th>Active Days</th><th>Last Seen</th></tr></thead>
 <tbody id="usersBody"></tbody>
 </table></div>
 </div>
 <div class="card">
 <h2>Models</h2>
 <div class="table-wrap"><table class="data-table">
-<thead><tr><th>Model</th><th>Requests</th><th>Users</th><th>Tokens</th><th>Avg Latency</th></tr></thead>
+<thead><tr><th>Model</th><th>Requests</th><th>Users</th><th>Tokens</th><th>Input</th><th>Output</th><th>Cache R</th><th>Cache W</th><th>Avg Latency</th></tr></thead>
 <tbody id="modelsBody"></tbody>
 </table></div>
 </div>
@@ -232,21 +232,29 @@ function loadData(){
 }
 function renderData(d){
 	lastData=d;
+	var t=d.totals;
 	var sc=document.getElementById("summaryCards");
 	sc.innerHTML=
-		summaryCard("Total Requests",fmtNum(d.totals.requests))+
-		summaryCard("Total Tokens",fmtNum(d.totals.total_tokens))+
-		summaryCard("Active Users",d.totals.users)+
-		summaryCard("Error Rate",d.totals.error_rate.toFixed(1)+"%");
+		summaryCard("Total Requests",fmtNum(t.requests))+
+		summaryCard("Input Tokens",fmtNum(t.input_tokens))+
+		summaryCard("Output Tokens",fmtNum(t.output_tokens))+
+		summaryCard("Cache Read",fmtNum(t.cache_read_tokens))+
+		summaryCard("Cache Write",fmtNum(t.cache_write_tokens))+
+		summaryCard("Active Users",t.users)+
+		summaryCard("Error Rate",t.error_rate.toFixed(1)+"%");
 	renderChart(d.daily,d.daily_models);
 	renderTable("usersBody",d.users,function(u){
 		return "<td>"+esc(u.name)+"</td><td><code>"+esc(u.key_hash)+"</code></td>"+
 			"<td>"+fmtNum(u.requests)+"</td><td>"+fmtNum(u.total_tokens)+"</td>"+
+			"<td>"+fmtNum(u.input_tokens)+"</td><td>"+fmtNum(u.output_tokens)+"</td>"+
+			"<td>"+fmtNum(u.cache_read_tokens)+"</td><td>"+fmtNum(u.cache_write_tokens)+"</td>"+
 			"<td>"+u.active_days+"</td><td>"+esc(u.last_seen)+"</td>";
 	});
 	renderTable("modelsBody",d.models,function(m){
 		return "<td>"+esc(m.model)+"</td><td>"+fmtNum(m.requests)+"</td>"+
 			"<td>"+m.users+"</td><td>"+fmtNum(m.total_tokens)+"</td>"+
+			"<td>"+fmtNum(m.input_tokens)+"</td><td>"+fmtNum(m.output_tokens)+"</td>"+
+			"<td>"+fmtNum(m.cache_read_tokens)+"</td><td>"+fmtNum(m.cache_write_tokens)+"</td>"+
 			"<td>"+Math.round(m.avg_latency_ms)+" ms</td>";
 	});
 }

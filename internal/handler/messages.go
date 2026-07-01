@@ -94,7 +94,14 @@ func (h *MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	model := config.FindModel(cfg, req.Model)
+	// Infer type hint: /v1/messages → anthropic
+	typeHint := config.BackendAnthropic
+
+	model := config.FindModel(cfg, req.Model, typeHint)
+	if model == nil {
+		// Fallback: try without type hint (backward compat).
+		model = config.FindModel(cfg, req.Model)
+	}
 	if model == nil {
 		httputil.WriteAnthropicError(w, http.StatusNotFound, "not_found_error", "unknown model")
 		return
@@ -204,7 +211,7 @@ func (h *MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		upReq.Header.Set("X-Request-ID", v)
 	}
 	if model.APIKey != "" {
-		upReq.Header.Set("Authorization", "Bearer "+model.APIKey)
+		setAuthHeader(upReq.Header, model.APIKey, model.AuthType, model.Type)
 	}
 
 	resp, err := h.client.Do(upReq)
@@ -270,8 +277,15 @@ func (h *MessagesHandler) handleNativePassthrough(ctx context.Context, w http.Re
 		body = RewriteModelName(body, model.Model)
 	}
 
-	// Build upstream URL: Anthropic backends keep /v1 in path.
-	upstreamURL := strings.TrimRight(model.Backend, "/") + "/v1/messages"
+	// Build upstream URL: if the backend already has /v1 suffix, don't
+	// duplicate it (e.g. https://ollama.com/v1 → /messages).
+	// Otherwise append /v1/messages (e.g. https://api.anthropic.com).
+	upstreamURL := strings.TrimRight(model.Backend, "/")
+	if strings.HasSuffix(upstreamURL, "/v1") {
+		upstreamURL += "/messages"
+	} else {
+		upstreamURL += "/v1/messages"
+	}
 
 	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
 	if err != nil {
@@ -288,7 +302,7 @@ func (h *MessagesHandler) handleNativePassthrough(ctx context.Context, w http.Re
 	}
 	// Anthropic auth and protocol headers.
 	if model.APIKey != "" {
-		upReq.Header.Set("X-Api-Key", model.APIKey)
+		setAuthHeader(upReq.Header, model.APIKey, model.AuthType, model.Type)
 	}
 	for _, h := range []string{"Anthropic-Version", "Anthropic-Beta"} {
 		if v := r.Header.Get(h); v != "" {

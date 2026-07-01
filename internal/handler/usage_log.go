@@ -20,17 +20,19 @@ import (
 // everything through `logUsage` and drift becomes a compile error.
 
 type usageLogInput struct {
-	startTime     time.Time
-	statusCode    int
-	keyName       string
-	keyHash       string
-	model         string
-	endpoint      string
-	requestBytes  int64
-	responseBytes int64
-	inputTokens   int
-	outputTokens  int
-	totalTokens   int
+	startTime       time.Time
+	statusCode      int
+	keyName         string
+	keyHash         string
+	model           string
+	endpoint        string
+	requestBytes    int64
+	responseBytes   int64
+	inputTokens     int
+	outputTokens    int
+	totalTokens     int
+	cacheReadTokens  int
+	cacheWriteTokens int
 }
 
 // logUsage writes a single usage record. Safe to call with ul==nil.
@@ -41,18 +43,20 @@ func logUsage(ul *usage.UsageLogger, in usageLogInput) {
 		return
 	}
 	rec := usage.UsageRecord{
-		Timestamp:     in.startTime,
-		KeyHash:       in.keyHash,
-		KeyName:       in.keyName,
-		Model:         in.model,
-		Endpoint:      in.endpoint,
-		StatusCode:    in.statusCode,
-		RequestBytes:  in.requestBytes,
-		ResponseBytes: in.responseBytes,
-		InputTokens:   in.inputTokens,
-		OutputTokens:  in.outputTokens,
-		TotalTokens:   in.totalTokens,
-		DurationMS:    time.Since(in.startTime).Milliseconds(),
+		Timestamp:       in.startTime,
+		KeyHash:         in.keyHash,
+		KeyName:         in.keyName,
+		Model:           in.model,
+		Endpoint:        in.endpoint,
+		StatusCode:      in.statusCode,
+		RequestBytes:    in.requestBytes,
+		ResponseBytes:   in.responseBytes,
+		InputTokens:     in.inputTokens,
+		OutputTokens:    in.outputTokens,
+		TotalTokens:     in.totalTokens,
+		CacheReadTokens:  in.cacheReadTokens,
+		CacheWriteTokens: in.cacheWriteTokens,
+		DurationMS:      time.Since(in.startTime).Milliseconds(),
 	}
 	go ul.Log(rec)
 }
@@ -64,6 +68,9 @@ func logUsageChat(ul *usage.UsageLogger, in usageLogInput, u *api.ChunkUsage) {
 		in.inputTokens = u.PromptTokens
 		in.outputTokens = u.CompletionTokens
 		in.totalTokens = u.TotalTokens
+		if u.PromptTokensDetails != nil {
+			in.cacheReadTokens = u.PromptTokensDetails.CachedTokens
+		}
 	}
 	logUsage(ul, in)
 }
@@ -74,7 +81,9 @@ func logUsageConverse(ul *usage.UsageLogger, in usageLogInput, u *converseUsage)
 	if u != nil {
 		in.inputTokens = u.Input
 		in.outputTokens = u.Output
-		in.totalTokens = u.Input + u.Output
+		in.totalTokens = u.Input + u.Output + u.CacheReadInput + u.CacheWriteInput
+		in.cacheReadTokens = u.CacheReadInput
+		in.cacheWriteTokens = u.CacheWriteInput
 	}
 	logUsage(ul, in)
 }

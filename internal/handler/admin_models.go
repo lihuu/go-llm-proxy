@@ -112,6 +112,7 @@ func (h *AdminHandler) ModelsMutate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Action       string         `json:"action"`
 		OriginalName string         `json:"original_name"`
+		OriginalType string         `json:"original_type"` // disambiguate models with same name but different type
 		Name         string         `json:"name"`
 		Force        bool           `json:"force"`
 		Model        *modelInputDTO `json:"model"`
@@ -127,7 +128,7 @@ func (h *AdminHandler) ModelsMutate(w http.ResponseWriter, r *http.Request) {
 			httputil.WriteError(w, http.StatusBadRequest, "model is required")
 			return
 		}
-		mc, err := req.Model.toConfig(h.cs.Get(), "")
+		mc, err := req.Model.toConfig(h.cs.Get(), "", "")
 		if err != nil {
 			httputil.WriteError(w, http.StatusBadRequest, err.Error())
 			return
@@ -148,16 +149,16 @@ func (h *AdminHandler) ModelsMutate(w http.ResponseWriter, r *http.Request) {
 			httputil.WriteError(w, http.StatusBadRequest, "original_name is required")
 			return
 		}
-		mc, err := req.Model.toConfig(h.cs.Get(), req.OriginalName)
+		mc, err := req.Model.toConfig(h.cs.Get(), req.OriginalName, req.OriginalType)
 		if err != nil {
 			httputil.WriteError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := h.cs.UpdateModel(req.OriginalName, mc); err != nil {
+		if err := h.cs.UpdateModel(req.OriginalName, req.OriginalType, mc); err != nil {
 			writeMutateError(w, err)
 			return
 		}
-		slog.Info("admin: model updated", "original", req.OriginalName, "name", mc.Name)
+		slog.Info("admin: model updated", "original", req.OriginalName, "type", req.OriginalType, "name", mc.Name)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": mc.Name})
 
 	case "delete":
@@ -165,11 +166,11 @@ func (h *AdminHandler) ModelsMutate(w http.ResponseWriter, r *http.Request) {
 			httputil.WriteError(w, http.StatusBadRequest, "name is required")
 			return
 		}
-		if err := h.cs.DeleteModel(req.Name, req.Force); err != nil {
+		if err := h.cs.DeleteModel(req.Name, req.OriginalType, req.Force); err != nil {
 			writeMutateError(w, err)
 			return
 		}
-		slog.Info("admin: model deleted", "name", req.Name, "force", req.Force)
+		slog.Info("admin: model deleted", "name", req.Name, "type", req.OriginalType, "force", req.Force)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 
 	default:
@@ -223,9 +224,9 @@ type processorsInputDTO struct {
 
 // toConfig translates the DTO into a ModelConfig suitable for passing to
 // AddModel / UpdateModel. Secret fields that are nil (omitted) are copied
-// from the existing model (found by originalName, or by the DTO's own Name
-// if originalName is empty, i.e. the add case).
-func (d *modelInputDTO) toConfig(cfg *config.Config, originalName string) (config.ModelConfig, error) {
+// from the existing model (found by originalName+originalType, or by the
+// DTO's own Name if originalName is empty, i.e. the add case).
+func (d *modelInputDTO) toConfig(cfg *config.Config, originalName, originalType string) (config.ModelConfig, error) {
 	mc := config.ModelConfig{
 		Name:             d.Name,
 		Backend:          d.Backend,
@@ -248,7 +249,7 @@ func (d *modelInputDTO) toConfig(cfg *config.Config, originalName string) (confi
 	// Resolve secret fields, preserving existing values when omitted.
 	var existing *config.ModelConfig
 	if originalName != "" {
-		existing = config.FindModel(cfg, originalName)
+		existing = config.FindModel(cfg, originalName, originalType)
 	}
 	mc.APIKey = resolveSecret(d.APIKey, existing, func(m *config.ModelConfig) string { return m.APIKey })
 	mc.AWSSecretKey = resolveSecret(d.AWSSecretKey, existing, func(m *config.ModelConfig) string { return m.AWSSecretKey })
@@ -581,8 +582,8 @@ function renderModels(){
       '<td style="text-align:center">'+audio+'</td>' +
       '<td>'+healthHTML+'</td>' +
       '<td class="row-actions"><div class="action-group">' +
-        '<button class="btn btn-secondary btn-sm" onclick="openModelModal(\''+escAttr(m.name)+'\')">Edit</button>' +
-        '<button class="btn btn-danger btn-sm" onclick="deleteModel(\''+escAttr(m.name)+'\')">Delete</button>' +
+        '<button class="btn btn-secondary btn-sm" onclick="openModelModal(\''+escAttr(m.name)+'\',\''+escAttr(t)+'\')">Edit</button>' +
+        '<button class="btn btn-danger btn-sm" onclick="deleteModel(\''+escAttr(m.name)+'\',\''+escAttr(t)+'\')">Delete</button>' +
       '</div></td>' +
     '</tr>';
   }
@@ -597,9 +598,10 @@ function renderHealth(h){
   return '<span class="health-dot '+cls+'" title="'+esc(title)+'"></span><span class="mono">'+esc(label)+(h.external?" (external)":"")+'</span>';
 }
 
-function openModelModal(name){
-  var m = name ? mstate.models.find(function(x){return x.name === name;}) : null;
+function openModelModal(name, modelType){
+  var m = name ? mstate.models.find(function(x){return x.name === name && (modelType ? x.type === modelType : true);}) : null;
   mstate.editing = name;
+  mstate.editingType = modelType || (m ? m.type : "");
   mstate.secretOverrides = {};
   document.getElementById("modelModalTitle").textContent = name ? ("Edit: "+name) : "Add Model";
   var form = document.getElementById("modelForm");
@@ -797,7 +799,7 @@ function submitModel(ev){
   btn.disabled = true; btn.textContent = "Saving…";
   var req;
   if(mstate.editing){
-    req = apiPost("/admin/models/mutate", {action:"update", original_name: mstate.editing, model: body});
+    req = apiPost("/admin/models/mutate", {action:"update", original_name: mstate.editing, original_type: mstate.editingType, model: body});
   } else {
     req = apiPost("/admin/models/mutate", {action:"add", model: body});
   }
@@ -819,13 +821,13 @@ function showFormErr(msg){
   el.style.display = "block";
 }
 
-function deleteModel(name){
-  if(!confirm('Delete model "'+name+'"? If keys reference it, the delete will be refused.')) return;
-  apiPost("/admin/models/mutate", {action:"delete", name: name}).then(function(res){
+function deleteModel(name, modelType){
+  if(!confirm('Delete model "'+name+'" (type: '+(modelType||'openai')+')? If keys reference it, the delete will be refused.')) return;
+  apiPost("/admin/models/mutate", {action:"delete", name: name, original_type: modelType}).then(function(res){
     if(!res.ok){
       var msg = (res.json.error && res.json.error.message) || "Delete failed";
       if(res.status === 409 && confirm(msg + "\\n\\nForce-delete anyway? References will be stripped from keys.")){
-        apiPost("/admin/models/mutate", {action:"delete", name: name, force: true}).then(function(r2){
+        apiPost("/admin/models/mutate", {action:"delete", name: name, original_type: modelType, force: true}).then(function(r2){
           if(!r2.ok){ flash(r2.json.error && r2.json.error.message || "Force delete failed", "error"); return; }
           flash("Deleted", "success"); loadModels();
         });

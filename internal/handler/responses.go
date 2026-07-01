@@ -99,7 +99,7 @@ func (h *ResponsesHandler) tryNativePassthrough(ctx context.Context, w http.Resp
 		upReq.Header.Set("X-Request-ID", v)
 	}
 	if model.APIKey != "" {
-		upReq.Header.Set("Authorization", "Bearer "+model.APIKey)
+		setAuthHeader(upReq.Header, model.APIKey, model.AuthType, model.Type)
 	}
 
 	resp, err := h.client.Do(upReq)
@@ -231,7 +231,11 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	model := config.FindModel(cfg, req.Model)
+	// /v1/responses is an OpenAI protocol path.
+	model := config.FindModel(cfg, req.Model, config.BackendOpenAI)
+	if model == nil {
+		model = config.FindModel(cfg, req.Model)
+	}
 	if model == nil {
 		httputil.WriteError(w, http.StatusNotFound, "unknown model")
 		return
@@ -349,7 +353,7 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		upReq.Header.Set("X-Request-ID", v)
 	}
 	if model.APIKey != "" {
-		upReq.Header.Set("Authorization", "Bearer "+model.APIKey)
+		setAuthHeader(upReq.Header, model.APIKey, model.AuthType, model.Type)
 	}
 
 	slog.Info("proxying responses request", "model", req.Model, "key", keyName)
@@ -526,9 +530,13 @@ func (h *ResponsesHandler) handleNonStreaming(w http.ResponseWriter, resp *http.
 
 	var usageObj any
 	if chatResp.Usage != nil {
+		inputDetails := map[string]any{"cached_tokens": 0}
+		if chatResp.Usage.PromptTokensDetails != nil {
+			inputDetails["cached_tokens"] = chatResp.Usage.PromptTokensDetails.CachedTokens
+		}
 		usageObj = map[string]any{
 			"input_tokens":          chatResp.Usage.PromptTokens,
-			"input_tokens_details":  nil,
+			"input_tokens_details":  inputDetails,
 			"output_tokens":         chatResp.Usage.CompletionTokens,
 			"output_tokens_details": nil,
 			"total_tokens":          chatResp.Usage.TotalTokens,

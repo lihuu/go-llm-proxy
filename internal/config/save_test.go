@@ -250,7 +250,7 @@ func TestAddModelDuplicateRejected(t *testing.T) {
 func TestUpdateModelSupportsRename(t *testing.T) {
 	path := writeFixture(t, baseFixture)
 	cs := loadStore(t, path)
-	err := cs.UpdateModel("model-a", ModelConfig{
+	err := cs.UpdateModel("model-a", "", ModelConfig{
 		Name:    "model-a-renamed",
 		Backend: "http://localhost:8000/v1",
 	})
@@ -263,7 +263,7 @@ func TestUpdateModelSupportsRename(t *testing.T) {
 	if err := cs.UpdateKeyModels(hash, nil); err != nil {
 		t.Fatalf("clearing models: %v", err)
 	}
-	if err := cs.UpdateModel("model-a", ModelConfig{
+	if err := cs.UpdateModel("model-a", "", ModelConfig{
 		Name:    "model-a-renamed",
 		Backend: "http://localhost:8000/v1",
 	}); err != nil {
@@ -281,7 +281,7 @@ func TestDeleteModelRefusesWhenReferenced(t *testing.T) {
 	path := writeFixture(t, baseFixture)
 	cs := loadStore(t, path)
 	// model-a is in keys[0].models, so non-force delete should fail.
-	err := cs.DeleteModel("model-a", false)
+	err := cs.DeleteModel("model-a", "", false)
 	if err == nil {
 		t.Fatal("expected error for referenced model")
 	}
@@ -293,7 +293,7 @@ func TestDeleteModelRefusesWhenReferenced(t *testing.T) {
 func TestDeleteModelForceStripsReferences(t *testing.T) {
 	path := writeFixture(t, baseFixture)
 	cs := loadStore(t, path)
-	if err := cs.DeleteModel("model-a", true); err != nil {
+	if err := cs.DeleteModel("model-a", "", true); err != nil {
 		t.Fatalf("DeleteModel force: %v", err)
 	}
 	// model-a gone, and keys[0].Models should no longer contain it.
@@ -312,7 +312,7 @@ func TestDeleteModelForceStripsReferences(t *testing.T) {
 func TestDeleteModelWhenUnreferenced(t *testing.T) {
 	path := writeFixture(t, baseFixture)
 	cs := loadStore(t, path)
-	if err := cs.DeleteModel("model-b", false); err != nil {
+	if err := cs.DeleteModel("model-b", "", false); err != nil {
 		t.Fatalf("DeleteModel: %v", err)
 	}
 	if FindModel(cs.Get(), "model-b") != nil {

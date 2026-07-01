@@ -373,8 +373,8 @@ func (cs *ConfigStore) AddModel(m ModelConfig) error {
 	}
 	cur := cs.Get()
 	for _, existing := range cur.Models {
-		if existing.Name == m.Name {
-			return fmt.Errorf("model %q already exists", m.Name)
+		if existing.Name == m.Name && existing.Type == m.Type {
+			return fmt.Errorf("model %q with type %q already exists", m.Name, m.Type)
 		}
 	}
 	return cs.mutateYAML(func(root *yaml.Node) error {
@@ -391,27 +391,28 @@ func (cs *ConfigStore) AddModel(m ModelConfig) error {
 	})
 }
 
-// UpdateModel replaces the model identified by originalName with m. If
-// m.Name != originalName, the model is renamed (new name must be unique).
-func (cs *ConfigStore) UpdateModel(originalName string, m ModelConfig) error {
+// UpdateModel replaces the model identified by (originalName, originalType)
+// with m. If m.Name != originalName, the model is renamed (new name+type must
+// be unique).
+func (cs *ConfigStore) UpdateModel(originalName, originalType string, m ModelConfig) error {
 	if m.Name == "" {
 		return fmt.Errorf("model name is required")
 	}
 	cur := cs.Get()
 	found := false
 	for _, existing := range cur.Models {
-		if existing.Name == originalName {
+		if existing.Name == originalName && existing.Type == originalType {
 			found = true
 			break
 		}
 	}
 	if !found {
-		return fmt.Errorf("model %q not found", originalName)
+		return fmt.Errorf("model %q with type %q not found", originalName, originalType)
 	}
-	if m.Name != originalName {
+	if m.Name != originalName || m.Type != originalType {
 		for _, existing := range cur.Models {
-			if existing.Name == m.Name {
-				return fmt.Errorf("model %q already exists", m.Name)
+			if existing.Name == m.Name && existing.Type == m.Type {
+				return fmt.Errorf("model %q with type %q already exists", m.Name, m.Type)
 			}
 		}
 	}
@@ -428,17 +429,26 @@ func (cs *ConfigStore) UpdateModel(originalName string, m ModelConfig) error {
 			if nameVal == nil || nameVal.Value != originalName {
 				continue
 			}
+			// Also check type for disambiguation when multiple models share a name.
+			typeVal := findMappingValue(entry, "type")
+			entryType := ""
+			if typeVal != nil {
+				entryType = typeVal.Value
+			}
+			if entryType != originalType {
+				continue
+			}
 			modelsNode.Content[i] = modelConfigNode(m)
 			return nil
 		}
-		return fmt.Errorf("model %q not found in config file", originalName)
+		return fmt.Errorf("model %q with type %q not found in config file", originalName, originalType)
 	})
 }
 
 // DeleteModel removes the named model. If force is false and the model is
 // referenced by keys or processors, the delete is refused with a descriptive
 // error listing the referrers.
-func (cs *ConfigStore) DeleteModel(name string, force bool) error {
+func (cs *ConfigStore) DeleteModel(name, modelType string, force bool) error {
 	cur := cs.Get()
 	if !force {
 		refs := modelReferrers(cur, name)
@@ -459,15 +469,22 @@ func (cs *ConfigStore) DeleteModel(name string, force bool) error {
 			if nameVal == nil || nameVal.Value != name {
 				continue
 			}
+			// Check type for disambiguation.
+			typeVal := findMappingValue(entry, "type")
+			entryType := ""
+			if typeVal != nil {
+				entryType = typeVal.Value
+			}
+			if entryType != modelType {
+				continue
+			}
 			modelsNode.Content = append(modelsNode.Content[:i], modelsNode.Content[i+1:]...)
-			// Force-delete also needs to strip references to this model from
-			// key allow-lists; otherwise validateConfig will reject the save.
 			if force {
 				stripModelReferences(root, name)
 			}
 			return nil
 		}
-		return fmt.Errorf("model %q not found in config file", name)
+		return fmt.Errorf("model %q with type %q not found in config file", name, modelType)
 	})
 }
 
@@ -601,6 +618,9 @@ func modelConfigNode(m ModelConfig) *yaml.Node {
 	add("backend", stringNode(m.Backend))
 	if m.APIKey != "" {
 		add("api_key", stringNode(m.APIKey))
+	}
+	if m.Provider != "" {
+		add("provider", stringNode(m.Provider))
 	}
 	if m.Model != "" && m.Model != m.Name {
 		add("model", stringNode(m.Model))

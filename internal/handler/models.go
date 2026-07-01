@@ -37,10 +37,20 @@ func (h *ModelsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	models := make([]modelObj, 0, len(cfg.Models))
+	seen := make(map[string]bool)
 	for _, m := range cfg.Models {
 		if !auth.KeyAllowsModel(key, m.Name) {
 			continue
 		}
+		// Only show OpenAI-type models in /v1/models (OpenAI protocol endpoint).
+		// Anthropic-type models are accessed via /v1/messages and don't appear here.
+		if m.Type == config.BackendAnthropic {
+			continue
+		}
+		if seen[m.Name] {
+			continue
+		}
+		seen[m.Name] = true
 		models = append(models, modelObj{
 			ID:            m.Name,
 			Object:        "model",
@@ -76,6 +86,9 @@ func (h *ModelsHandler) ServeStatus(w http.ResponseWriter, r *http.Request) {
 	statuses := make([]modelStatus, 0, len(cfg.Models))
 	for _, m := range cfg.Models {
 		if !auth.KeyAllowsModel(key, m.Name) {
+			continue
+		}
+		if m.Type == config.BackendAnthropic {
 			continue
 		}
 

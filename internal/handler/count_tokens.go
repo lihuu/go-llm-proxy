@@ -71,7 +71,11 @@ func (h *CountTokensHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	model := config.FindModel(cfg, req.Model)
+	// /v1/messages/count_tokens is an Anthropic protocol path.
+	model := config.FindModel(cfg, req.Model, config.BackendAnthropic)
+	if model == nil {
+		model = config.FindModel(cfg, req.Model)
+	}
 	if model == nil {
 		httputil.WriteAnthropicError(w, http.StatusNotFound, "not_found_error", "unknown model")
 		return
@@ -113,7 +117,7 @@ func (h *CountTokensHandler) proxyNative(ctx context.Context, w http.ResponseWri
 
 	copyHeaders(upReq.Header, r.Header, config.BackendAnthropic)
 	if model.APIKey != "" {
-		upReq.Header.Set("X-Api-Key", model.APIKey)
+		setAuthHeader(upReq.Header, model.APIKey, model.AuthType, model.Type)
 	}
 
 	resp, err := h.client.Do(upReq)
