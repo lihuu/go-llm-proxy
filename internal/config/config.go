@@ -94,6 +94,7 @@ type ModelConfig struct {
 	ResponsesMode  string            `yaml:"responses_mode"`  // "auto" (default), "native", or "translate"
 	MessagesMode   string            `yaml:"messages_mode"`   // "auto" (default), "native", or "translate"
 	ContextWindow  int               `yaml:"context_window"`  // max context tokens (0 = auto-detect from backend)
+	MaxOutput      int               `yaml:"max_output"`      // max output tokens (0 = no clamp); clamps max_tokens/max_completion_tokens before forwarding
 	SupportsVision bool              `yaml:"supports_vision"` // model handles images natively
 	SupportsAudio  bool              `yaml:"supports_audio"`  // model handles audio (transcription or audio input)
 	ForcePipeline  bool              `yaml:"force_pipeline"`  // run pipeline even on native backends
@@ -637,6 +638,36 @@ func (m *ModelConfig) ApplySamplingDefaults(chatReq map[string]any) {
 
 	if len(applied) > 0 {
 		slog.Debug("applied sampling defaults", "model", m.Name, "params", applied)
+	}
+}
+
+// ClampMaxTokens clamps max_tokens / max_completion_tokens in a Chat Completions
+// request body to the model's MaxOutput limit. If MaxOutput is 0 (unset), no
+// clamping is performed. This prevents the client from requesting more output
+// tokens than the backend supports (e.g. Ollama Cloud deepseek-v4-flash caps at
+// 65536 output tokens).
+func (m *ModelConfig) ClampMaxTokens(chatReq map[string]any) {
+	if m.MaxOutput <= 0 {
+		return
+	}
+	// max_completion_tokens (newer field) takes precedence over max_tokens.
+	for _, key := range []string{"max_completion_tokens", "max_tokens"} {
+		if val, exists := chatReq[key]; exists {
+			switch v := val.(type) {
+			case float64:
+				if int(v) > m.MaxOutput {
+					chatReq[key] = float64(m.MaxOutput)
+					slog.Debug("clamped max_tokens", "model", m.Name, "key", key,
+						"from", int(v), "to", m.MaxOutput)
+				}
+			case int:
+				if v > m.MaxOutput {
+					chatReq[key] = m.MaxOutput
+					slog.Debug("clamped max_tokens", "model", m.Name, "key", key,
+						"from", v, "to", m.MaxOutput)
+				}
+			}
+		}
 	}
 }
 

@@ -211,6 +211,22 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Clamp max_tokens to the model's MaxOutput limit before forwarding.
+	// This must run even when model.Defaults is nil.
+	if isChatCompletions && model.MaxOutput > 0 {
+		if parsedChatReq == nil {
+			if err := json.Unmarshal(body, &parsedChatReq); err != nil {
+				slog.Warn("failed to parse chat request for max_tokens clamp", "error", err)
+			}
+		}
+		if parsedChatReq != nil {
+			model.ClampMaxTokens(parsedChatReq)
+			if newBody, err := json.Marshal(parsedChatReq); err == nil {
+				body = newBody
+			}
+		}
+	}
+
 	// Build the upstream URL.
 	// For Anthropic backends, keep the full /v1/... path only if the backend
 	// URL doesn't already end with /v1 (e.g. https://ollama.com/v1).

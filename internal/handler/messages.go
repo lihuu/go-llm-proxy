@@ -189,6 +189,9 @@ func (h *MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Clamp max_tokens to the model's MaxOutput limit before forwarding.
+	model.ClampMaxTokens(chatReq)
+
 	chatBody, err := json.Marshal(chatReq)
 	if err != nil {
 		httputil.WriteAnthropicError(w, http.StatusInternalServerError, "api_error", "failed to build upstream request")
@@ -275,6 +278,13 @@ func (h *MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *MessagesHandler) handleNativePassthrough(ctx context.Context, w http.ResponseWriter, r *http.Request, body []byte, req messagesRequest, model *config.ModelConfig, keyName, keyHash string, startTime time.Time) {
 	if model.Model != req.Model {
 		body = RewriteModelName(body, model.Model)
+	}
+
+	// Clamp max_tokens to the model's MaxOutput limit before forwarding.
+	if model.MaxOutput > 0 && req.MaxTokens > model.MaxOutput {
+		body = clampMaxTokensInBody(body, model.MaxOutput)
+		slog.Debug("clamped max_tokens in native passthrough", "model", model.Name,
+			"from", req.MaxTokens, "to", model.MaxOutput)
 	}
 
 	// Build upstream URL: if the backend already has /v1 suffix, don't
@@ -500,6 +510,31 @@ func (h *MessagesHandler) handleNonStreaming(w http.ResponseWriter, resp *http.R
 }
 
 // --- Shared helpers ---
+
+// clampMaxTokensInBody rewrites the max_tokens field in a raw JSON body to
+// cap it at the given limit. Used for native Anthropic passthrough where the
+// body is forwarded as-is but we need to clamp before sending upstream.
+func clampMaxTokensInBody(body []byte, maxOutput int) []byte {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil {
+		return body
+	}
+	raw, ok := m["max_tokens"]
+	if !ok {
+		return body
+	}
+	var val int
+	if json.Unmarshal(raw, &val) != nil {
+		return body
+	}
+	if val <= maxOutput {
+		return body
+	}
+	newVal, _ := json.Marshal(maxOutput)
+	m["max_tokens"] = json.RawMessage(newVal)
+	out, _ := json.Marshal(m)
+	return out
+}
 
 func (h *MessagesHandler) sendChatRequest(ctx context.Context, chatReq map[string]any, model *config.ModelConfig) (*api.ChatResponse, error) {
 	return sendChatCompletionsRequest(ctx, h.client, chatReq, model)

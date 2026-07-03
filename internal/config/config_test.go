@@ -390,3 +390,54 @@ func TestApplySamplingDefaults_NilDefaults(t *testing.T) {
 		t.Error("should not add temperature when defaults is nil")
 	}
 }
+
+func TestClampMaxTokens_NoOpWhenUnset(t *testing.T) {
+	model := &ModelConfig{Name: "test", MaxOutput: 0}
+	req := map[string]any{"max_tokens": 100000}
+	model.ClampMaxTokens(req)
+	if req["max_tokens"] != 100000 {
+		t.Fatalf("expected no change, got %v", req["max_tokens"])
+	}
+}
+
+func TestClampMaxTokens_ClampsMaxTokens(t *testing.T) {
+	model := &ModelConfig{Name: "test", MaxOutput: 65536}
+	req := map[string]any{"max_tokens": float64(384000)}
+	model.ClampMaxTokens(req)
+	got, ok := req["max_tokens"].(float64)
+	if !ok || int(got) != 65536 {
+		t.Fatalf("expected 65536, got %v (type %T)", req["max_tokens"], req["max_tokens"])
+	}
+}
+
+func TestClampMaxTokens_ClampsMaxCompletionTokens(t *testing.T) {
+	model := &ModelConfig{Name: "test", MaxOutput: 65536}
+	req := map[string]any{"max_completion_tokens": float64(384000)}
+	model.ClampMaxTokens(req)
+	got, ok := req["max_completion_tokens"].(float64)
+	if !ok || int(got) != 65536 {
+		t.Fatalf("expected 65536, got %v (type %T)", req["max_completion_tokens"], req["max_completion_tokens"])
+	}
+}
+
+func TestClampMaxTokens_MaxCompletionTokensWins(t *testing.T) {
+	model := &ModelConfig{Name: "test", MaxOutput: 65536}
+	req := map[string]any{"max_completion_tokens": float64(384000), "max_tokens": 1000}
+	model.ClampMaxTokens(req)
+	got, ok := req["max_completion_tokens"].(float64)
+	if !ok || int(got) != 65536 {
+		t.Fatalf("expected max_completion_tokens=65536, got %v (type %T)", req["max_completion_tokens"], req["max_completion_tokens"])
+	}
+	if req["max_tokens"] != 1000 {
+		t.Fatalf("expected max_tokens=1000, got %v", req["max_tokens"])
+	}
+}
+
+func TestClampMaxTokens_NoClampWhenBelowLimit(t *testing.T) {
+	model := &ModelConfig{Name: "test", MaxOutput: 65536}
+	req := map[string]any{"max_tokens": 32000}
+	model.ClampMaxTokens(req)
+	if req["max_tokens"] != 32000 {
+		t.Fatalf("expected 32000 unchanged, got %v", req["max_tokens"])
+	}
+}

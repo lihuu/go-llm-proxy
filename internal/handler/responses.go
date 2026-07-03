@@ -84,6 +84,11 @@ func (h *ResponsesHandler) tryNativePassthrough(ctx context.Context, w http.Resp
 		body = RewriteModelName(body, model.Model)
 	}
 
+	// Clamp max_output_tokens to the model's MaxOutput limit before forwarding.
+	if model.MaxOutput > 0 {
+		body = clampMaxOutputTokensInBody(body, model.MaxOutput)
+	}
+
 	upstreamURL := strings.TrimRight(model.Backend, "/") + path
 
 	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
@@ -331,6 +336,9 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Clamp max_completion_tokens / max_tokens to the model's MaxOutput limit.
+	model.ClampMaxTokens(chatReq)
+
 	chatBody, err := json.Marshal(chatReq)
 	if err != nil {
 		httputil.WriteError(w, http.StatusInternalServerError, "failed to build upstream request")
@@ -570,4 +578,29 @@ func (h *ResponsesHandler) handleNonStreaming(w http.ResponseWriter, resp *http.
 
 func (h *ResponsesHandler) sendChatRequest(ctx context.Context, chatReq map[string]any, model *config.ModelConfig) (*api.ChatResponse, error) {
 	return sendChatCompletionsRequest(ctx, h.client, chatReq, model)
+}
+
+// clampMaxOutputTokensInBody rewrites the max_output_tokens field in a raw
+// JSON body to cap it at the given limit. Used for native Responses API
+// passthrough where the body is forwarded as-is.
+func clampMaxOutputTokensInBody(body []byte, maxOutput int) []byte {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(body, &m) != nil {
+		return body
+	}
+	raw, ok := m["max_output_tokens"]
+	if !ok {
+		return body
+	}
+	var val int
+	if json.Unmarshal(raw, &val) != nil {
+		return body
+	}
+	if val <= maxOutput {
+		return body
+	}
+	newVal, _ := json.Marshal(maxOutput)
+	m["max_output_tokens"] = json.RawMessage(newVal)
+	out, _ := json.Marshal(m)
+	return out
 }

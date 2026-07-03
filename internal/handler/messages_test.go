@@ -1537,3 +1537,47 @@ func TestMessagesHandler_MixedToolCalls(t *testing.T) {
 		t.Errorf("expected tool_use stop_reason for client tool, got %v", resp["stop_reason"])
 	}
 }
+
+func TestClampMaxTokensInBody_NoOpWhenBelowLimit(t *testing.T) {
+	body := []byte(`{"model":"test","max_tokens":32000,"messages":[{"role":"user","content":"hi"}]}`)
+	got := clampMaxTokensInBody(body, 65536)
+	if string(got) != string(body) {
+		t.Fatalf("expected no change, got %s", got)
+	}
+}
+
+func TestClampMaxTokensInBody_ClampsWhenAboveLimit(t *testing.T) {
+	body := []byte(`{"model":"test","max_tokens":384000,"messages":[{"role":"user","content":"hi"}]}`)
+	got := clampMaxTokensInBody(body, 65536)
+	var m map[string]any
+	json.Unmarshal(got, &m)
+	if m["max_tokens"] != float64(65536) {
+		t.Fatalf("expected max_tokens=65536, got %v", m["max_tokens"])
+	}
+}
+
+func TestClampMaxTokensInBody_NoOpWhenNoMaxTokens(t *testing.T) {
+	body := []byte(`{"model":"test","messages":[{"role":"user","content":"hi"}]}`)
+	got := clampMaxTokensInBody(body, 65536)
+	if string(got) != string(body) {
+		t.Fatalf("expected no change, got %s", got)
+	}
+}
+
+func TestClampMaxOutputTokensInBody_ClampsWhenAboveLimit(t *testing.T) {
+	body := []byte(`{"model":"test","max_output_tokens":384000,"input":"hello"}`)
+	got := clampMaxOutputTokensInBody(body, 65536)
+	var m map[string]any
+	json.Unmarshal(got, &m)
+	if m["max_output_tokens"] != float64(65536) {
+		t.Fatalf("expected max_output_tokens=65536, got %v", m["max_output_tokens"])
+	}
+}
+
+func TestClampMaxOutputTokensInBody_NoOpWhenBelowLimit(t *testing.T) {
+	body := []byte(`{"model":"test","max_output_tokens":32000,"input":"hello"}`)
+	got := clampMaxOutputTokensInBody(body, 65536)
+	if string(got) != string(body) {
+		t.Fatalf("expected no change, got %s", got)
+	}
+}
