@@ -145,6 +145,7 @@ func (h *ResponsesHandler) HandleCompact(w http.ResponseWriter, r *http.Request)
 		httputil.WriteError(w, http.StatusBadGateway, "upstream request failed")
 		return
 	}
+	resp.Body = newTTFBReader(resp.Body, startTime)
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
@@ -214,6 +215,7 @@ func (h *ResponsesHandler) HandleCompact(w http.ResponseWriter, r *http.Request)
 		keyName: keyName, keyHash: keyHash,
 		model: req.Model, endpoint: "/v1/responses/compact",
 		requestBytes: int64(len(chatBody)), responseBytes: int64(len(respBody)),
+		ttfbMs: extractTTFB(resp),
 	}, chatResp.Usage)
 }
 

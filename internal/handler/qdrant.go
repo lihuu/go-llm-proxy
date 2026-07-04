@@ -164,6 +164,7 @@ func (h *QdrantHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusBadGateway, "upstream request failed")
 		return
 	}
+	resp.Body = newTTFBReader(resp.Body, startTime)
 	defer resp.Body.Close()
 
 	// Copy response headers.
@@ -190,6 +191,7 @@ func (h *QdrantHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		keyName: appKey.Name, keyHash: usage.HashKey(appKey.Key),
 		model: "qdrant", endpoint: "/qdrant" + qdrantPath,
 		requestBytes: int64(len(body)), responseBytes: int64(len(respBody)),
+		ttfbMs: extractTTFB(resp),
 	})
 }
 

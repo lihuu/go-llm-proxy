@@ -35,7 +35,8 @@ func RunUsageReport(dbPath string, days int) {
 			SUM(total_tokens)              AS total_tokens,
 			SUM(request_bytes)             AS request_bytes,
 			SUM(response_bytes)            AS response_bytes,
-			CAST(AVG(duration_ms) AS INTEGER) AS avg_duration_ms
+			CAST(AVG(duration_ms) AS INTEGER) AS avg_duration_ms,
+			CAST(AVG(ttfb_ms) AS INTEGER) AS avg_ttfb_ms
 		FROM usage
 		WHERE timestamp >= date('now', ?)
 		GROUP BY day, key_hash
@@ -48,8 +49,8 @@ func RunUsageReport(dbPath string, days int) {
 	defer rows.Close()
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(w, "DATE\tUSER\tKEY\tREQUESTS\tOK\tERROR\tINPUT TOK\tOUTPUT TOK\tTOTAL TOK\tREQ BYTES\tRESP BYTES\tAVG MS\n")
-	fmt.Fprintf(w, "----\t----\t---\t--------\t--\t-----\t---------\t----------\t---------\t---------\t----------\t------\n")
+	fmt.Fprintf(w, "DATE\tUSER\tKEY\tREQUESTS\tOK\tERROR\tINPUT TOK\tOUTPUT TOK\tTOTAL TOK\tREQ BYTES\tRESP BYTES\tAVG MS\tTTFB MS\n")
+	fmt.Fprintf(w, "----\t----\t---\t--------\t--\t-----\t---------\t----------\t---------\t---------\t----------\t------\t-------\n")
 
 	count := 0
 	for rows.Next() {
@@ -66,10 +67,11 @@ func RunUsageReport(dbPath string, days int) {
 			requestBytes  int64
 			responseBytes int64
 			avgDuration   int64
+			avgTTFB      int64
 		)
 		if err := rows.Scan(&day, &keyName, &keyHash, &requests, &successful, &errors,
 			&inputTokens, &outputTokens, &totalTokens,
-			&requestBytes, &responseBytes, &avgDuration); err != nil {
+			&requestBytes, &responseBytes, &avgDuration, &avgTTFB); err != nil {
 			fmt.Fprintf(os.Stderr, "scan error: %v\n", err)
 			continue
 		}
@@ -79,7 +81,7 @@ func RunUsageReport(dbPath string, days int) {
 			displayName = "(unnamed)"
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%d\n",
+		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%d\t%d\n",
 			day,
 			displayName,
 			keyHash[:8],
@@ -92,6 +94,7 @@ func RunUsageReport(dbPath string, days int) {
 			formatBytes(requestBytes),
 			formatBytes(responseBytes),
 			avgDuration,
+			avgTTFB,
 		)
 		count++
 	}
@@ -193,7 +196,8 @@ func RunModelReport(dbPath string, days int) {
 			SUM(input_tokens)              AS input_tokens,
 			SUM(output_tokens)             AS output_tokens,
 			SUM(total_tokens)              AS total_tokens,
-			CAST(AVG(duration_ms) AS INTEGER) AS avg_duration_ms
+			CAST(AVG(duration_ms) AS INTEGER) AS avg_duration_ms,
+			CAST(AVG(ttfb_ms) AS INTEGER) AS avg_ttfb_ms
 		FROM usage
 		WHERE timestamp >= date('now', ?)
 		GROUP BY model
@@ -207,8 +211,8 @@ func RunModelReport(dbPath string, days int) {
 
 	fmt.Println("=== Model Summary ===")
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(w, "MODEL\tREQUESTS\tUSERS\tINPUT TOK\tOUTPUT TOK\tTOTAL TOK\tAVG MS\n")
-	fmt.Fprintf(w, "-----\t--------\t-----\t---------\t----------\t---------\t------\n")
+	fmt.Fprintf(w, "MODEL\tREQUESTS\tUSERS\tINPUT TOK\tOUTPUT TOK\tTOTAL TOK\tAVG MS\tTTFB MS\n")
+	fmt.Fprintf(w, "-----\t--------\t-----\t---------\t----------\t---------\t------\t-------\n")
 
 	for rows.Next() {
 		var (
@@ -219,12 +223,13 @@ func RunModelReport(dbPath string, days int) {
 			outputTokens int64
 			totalTokens  int64
 			avgDuration  int64
+			avgTTFB     int64
 		)
 		if err := rows.Scan(&model, &requests, &uniqueUsers,
-			&inputTokens, &outputTokens, &totalTokens, &avgDuration); err != nil {
+			&inputTokens, &outputTokens, &totalTokens, &avgDuration, &avgTTFB); err != nil {
 			continue
 		}
-		fmt.Fprintf(w, "%s\t%d\t%d\t%s\t%s\t%s\t%d\n",
+		fmt.Fprintf(w, "%s\t%d\t%d\t%s\t%s\t%s\t%d\t%d\n",
 			model,
 			requests,
 			uniqueUsers,
@@ -232,6 +237,7 @@ func RunModelReport(dbPath string, days int) {
 			formatNumber(outputTokens),
 			formatNumber(totalTokens),
 			avgDuration,
+			avgTTFB,
 		)
 	}
 	w.Flush()

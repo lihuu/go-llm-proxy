@@ -206,7 +206,7 @@ func (h *UsageDashboardHandler) renderDashboard(w http.ResponseWriter) {
 <div class="card">
 <h2>Models</h2>
 <div class="table-wrap"><table class="data-table">
-<thead><tr><th>Model</th><th>Requests</th><th>Users</th><th>Tokens</th><th>Input</th><th>Output</th><th>Cache R</th><th>Cache W</th><th>Avg Latency</th></tr></thead>
+<thead><tr><th>Model</th><th>Requests</th><th>Users</th><th>Tokens</th><th>Input</th><th>Output</th><th>Cache R</th><th>Cache W</th><th>Avg Latency</th><th>Avg TTFB</th></tr></thead>
 <tbody id="modelsBody"></tbody>
 </table></div>
 </div>
@@ -255,7 +255,8 @@ function renderData(d){
 			"<td>"+m.users+"</td><td>"+fmtNum(m.total_tokens)+"</td>"+
 			"<td>"+fmtNum(m.input_tokens)+"</td><td>"+fmtNum(m.output_tokens)+"</td>"+
 			"<td>"+fmtNum(m.cache_read_tokens)+"</td><td>"+fmtNum(m.cache_write_tokens)+"</td>"+
-			"<td>"+Math.round(m.avg_latency_ms)+" ms</td>";
+			"<td>"+Math.round(m.avg_latency_ms)+" ms</td>"+
+			"<td>"+Math.round(m.avg_ttfb_ms)+" ms</td>";
 	});
 }
 function summaryCard(label,value){

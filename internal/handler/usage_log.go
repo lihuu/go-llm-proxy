@@ -1,11 +1,52 @@
 package handler
 
 import (
+	"io"
+	"net/http"
+	"sync/atomic"
 	"time"
 
 	"go-llm-proxy/internal/api"
 	"go-llm-proxy/internal/usage"
 )
+
+// ttfbReader wraps an io.ReadCloser and records the wall-clock time of the
+// first successful Read call. Safe for concurrent use; the TTFB is captured
+// atomically on the first read and never overwritten.
+type ttfbReader struct {
+	rc        io.ReadCloser
+	startTime time.Time
+	ttfbMs    atomic.Int64
+}
+
+func newTTFBReader(rc io.ReadCloser, startTime time.Time) *ttfbReader {
+	return &ttfbReader{rc: rc, startTime: startTime}
+}
+
+func (r *ttfbReader) Read(p []byte) (int, error) {
+	n, err := r.rc.Read(p)
+	if n > 0 && r.ttfbMs.Load() == 0 {
+		r.ttfbMs.Store(time.Since(r.startTime).Milliseconds())
+	}
+	return n, err
+}
+
+func (r *ttfbReader) Close() error {
+	return r.rc.Close()
+}
+
+func (r *ttfbReader) TTFBMs() int64 {
+	return r.ttfbMs.Load()
+}
+
+// extractTTFB extracts the time-to-first-byte from a response body that
+// has been wrapped with newTTFBReader. Returns 0 if the body was not wrapped.
+func extractTTFB(resp *http.Response) int64 {
+	if tr, ok := resp.Body.(*ttfbReader); ok {
+		return tr.TTFBMs()
+	}
+	return 0
+}
 
 // Unified usage-logging helpers.
 //
@@ -33,6 +74,7 @@ type usageLogInput struct {
 	totalTokens     int
 	cacheReadTokens  int
 	cacheWriteTokens int
+	ttfbMs          int64 // time-to-first-byte in ms; 0 = not captured
 }
 
 // logUsage writes a single usage record. Safe to call with ul==nil.
@@ -57,6 +99,7 @@ func logUsage(ul *usage.UsageLogger, in usageLogInput) {
 		CacheReadTokens:  in.cacheReadTokens,
 		CacheWriteTokens: in.cacheWriteTokens,
 		DurationMS:      time.Since(in.startTime).Milliseconds(),
+		TTFBMs:          in.ttfbMs,
 	}
 	go ul.Log(rec)
 }

@@ -33,6 +33,9 @@ func (h *MessagesHandler) handleStreaming(w http.ResponseWriter, resp *http.Resp
 		return
 	}
 
+	// Wrap response body to capture TTFB.
+	resp.Body = newTTFBReader(resp.Body, startTime)
+
 	if !headersAlreadySent {
 		httputil.SetSecurityHeaders(w)
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -496,6 +499,7 @@ func (h *MessagesHandler) handleStreaming(w http.ResponseWriter, resp *http.Resp
 		keyName: keyName, keyHash: keyHash,
 		model: req.Model, endpoint: "/v1/messages",
 		requestBytes: requestBytes, responseBytes: responseBytes,
+		ttfbMs: extractTTFB(resp),
 	}, usageData)
 }
 

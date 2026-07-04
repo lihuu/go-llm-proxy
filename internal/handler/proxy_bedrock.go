@@ -79,6 +79,7 @@ func (p *ProxyHandler) handleBedrockChat(
 		httputil.WriteError(w, http.StatusBadGateway, "upstream request failed")
 		return
 	}
+	resp.Body = newTTFBReader(resp.Body, startTime)
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
@@ -98,6 +99,7 @@ func (p *ProxyHandler) handleBedrockChat(
 			keyName: keyName, keyHash: keyHash,
 			model: modelName, endpoint: "/v1/chat/completions",
 			requestBytes: int64(len(body)), responseBytes: int64(len(errBody)),
+			ttfbMs: extractTTFB(resp),
 		})
 		return
 	}
@@ -114,6 +116,7 @@ func (p *ProxyHandler) handleBedrockChat(
 			keyName: keyName, keyHash: keyHash,
 			model: modelName, endpoint: "/v1/chat/completions",
 			requestBytes: int64(len(body)), responseBytes: respBytes,
+			ttfbMs: extractTTFB(resp),
 		}, usageData)
 		return
 	}
@@ -141,6 +144,7 @@ func (p *ProxyHandler) handleBedrockChat(
 		keyName: keyName, keyHash: keyHash,
 		model: modelName, endpoint: "/v1/chat/completions",
 		requestBytes: int64(len(body)), responseBytes: int64(len(respBody)),
+		ttfbMs: extractTTFB(resp),
 	}, usageData)
 }
 

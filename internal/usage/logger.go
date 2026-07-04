@@ -42,6 +42,7 @@ type UsageRecord struct {
 	CacheReadTokens  int
 	CacheWriteTokens int
 	DurationMS      int64
+	TTFBMs         int64 // time-to-first-byte: wall-clock ms from start to first response byte
 }
 
 const schema = `
@@ -60,7 +61,8 @@ CREATE TABLE IF NOT EXISTS usage (
 	total_tokens       INTEGER NOT NULL DEFAULT 0,
 	cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
 	cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-	duration_ms        INTEGER NOT NULL DEFAULT 0
+	duration_ms        INTEGER NOT NULL DEFAULT 0,
+	ttfb_ms            INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage(timestamp);
@@ -88,6 +90,11 @@ func NewUsageLogger(dbPath string) (*UsageLogger, error) {
 		}
 	}
 
+	// Migrate: add ttfb_ms column for databases created before v0.4.1.
+	if _, err := db.Exec("ALTER TABLE usage ADD COLUMN ttfb_ms INTEGER NOT NULL DEFAULT 0"); err != nil {
+		// Column already exists.
+	}
+
 	readDB, err := sql.Open("sqlite", dbPath+"?mode=ro&_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
 		db.Close()
@@ -108,8 +115,8 @@ func (ul *UsageLogger) Log(rec UsageRecord) {
 		INSERT INTO usage (timestamp, key_hash, key_name, model, endpoint,
 			status_code, request_bytes, response_bytes,
 			input_tokens, output_tokens, total_tokens,
-			cache_read_tokens, cache_write_tokens, duration_ms)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			cache_read_tokens, cache_write_tokens, duration_ms, ttfb_ms)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		rec.Timestamp.UTC().Format(time.RFC3339),
 		rec.KeyHash,
 		rec.KeyName,
@@ -124,6 +131,7 @@ func (ul *UsageLogger) Log(rec UsageRecord) {
 		rec.CacheReadTokens,
 		rec.CacheWriteTokens,
 		rec.DurationMS,
+		rec.TTFBMs,
 	)
 	if err != nil {
 		slog.Error("failed to log usage", "error", err)
@@ -204,6 +212,7 @@ type ModelRow struct {
 	CacheReadTokens  int64   `json:"cache_read_tokens"`
 	CacheWriteTokens int64   `json:"cache_write_tokens"`
 	AvgLatency       float64 `json:"avg_latency_ms"`
+	AvgTTFB         float64 `json:"avg_ttfb_ms"`
 }
 
 func (ul *UsageLogger) QueryDashboardData(days int) (*DashboardData, error) {
@@ -317,7 +326,8 @@ func (ul *UsageLogger) QueryDashboardData(days int) (*DashboardData, error) {
 			COALESCE(SUM(output_tokens), 0),
 			COALESCE(SUM(cache_read_tokens), 0),
 			COALESCE(SUM(cache_write_tokens), 0),
-			CAST(AVG(duration_ms) AS REAL) AS avg_duration_ms
+			CAST(AVG(duration_ms) AS REAL) AS avg_duration_ms,
+			CAST(AVG(ttfb_ms) AS REAL) AS avg_ttfb_ms
 		FROM usage
 		WHERE timestamp >= date('now', ?)
 		GROUP BY model
@@ -331,7 +341,7 @@ func (ul *UsageLogger) QueryDashboardData(days int) (*DashboardData, error) {
 		if err := modelRows.Scan(&r.Model, &r.Requests, &r.Users, &r.TotalTokens,
 			&r.InputTokens, &r.OutputTokens,
 			&r.CacheReadTokens, &r.CacheWriteTokens,
-			&r.AvgLatency); err != nil {
+			&r.AvgLatency, &r.AvgTTFB); err != nil {
 			continue
 		}
 		data.Models = append(data.Models, r)

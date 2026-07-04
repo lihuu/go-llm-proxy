@@ -78,6 +78,7 @@ func (h *MessagesHandler) handleBedrock(
 		httputil.WriteAnthropicError(w, http.StatusBadGateway, "api_error", "upstream request failed")
 		return
 	}
+	resp.Body = newTTFBReader(resp.Body, startTime)
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
@@ -101,6 +102,7 @@ func (h *MessagesHandler) handleBedrock(
 			keyName: keyName, keyHash: keyHash,
 			model: req.Model, endpoint: "/v1/messages",
 			requestBytes: int64(len(body)), responseBytes: int64(len(errBody)),
+			ttfbMs: extractTTFB(resp),
 		})
 		return
 	}
@@ -117,6 +119,7 @@ func (h *MessagesHandler) handleBedrock(
 			keyName: keyName, keyHash: keyHash,
 			model: req.Model, endpoint: "/v1/messages",
 			requestBytes: int64(len(body)), responseBytes: respBytes,
+			ttfbMs: extractTTFB(resp),
 		}, usageData)
 		return
 	}
@@ -144,6 +147,7 @@ func (h *MessagesHandler) handleBedrock(
 		keyName: keyName, keyHash: keyHash,
 		model: req.Model, endpoint: "/v1/messages",
 		requestBytes: int64(len(body)), responseBytes: int64(len(respBody)),
+		ttfbMs: extractTTFB(resp),
 	}, usageData)
 }
 

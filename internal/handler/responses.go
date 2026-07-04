@@ -376,6 +376,7 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		httputil.WriteError(w, http.StatusBadGateway, "upstream request failed")
 		return
 	}
+	resp.Body = newTTFBReader(resp.Body, startTime)
 	defer resp.Body.Close()
 
 	// Forward upstream error responses.
@@ -573,6 +574,7 @@ func (h *ResponsesHandler) handleNonStreaming(w http.ResponseWriter, resp *http.
 		keyName: keyName, keyHash: keyHash,
 		model: req.Model, endpoint: "/v1/responses",
 		requestBytes: requestBytes, responseBytes: int64(len(body)),
+		ttfbMs: extractTTFB(resp),
 	}, chatResp.Usage)
 }
 

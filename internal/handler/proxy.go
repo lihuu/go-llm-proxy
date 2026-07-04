@@ -48,6 +48,7 @@ type proxyRequestContext struct {
 	keyName     string
 	keyHash     string
 	startTime   time.Time
+	ttfbMs      int64 // time-to-first-byte; set by streaming loop
 }
 
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -281,6 +282,9 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	// Wrap the response body to capture time-to-first-byte for all paths.
+	resp.Body = newTTFBReader(resp.Body, startTime)
+
 	isStreaming := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 
 	copyResponseHeaders(w, resp)
@@ -292,11 +296,16 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"body", string(errBody))
 		httputil.WriteError(w, resp.StatusCode, fmt.Sprintf("backend returned HTTP %d", resp.StatusCode))
 
+		ttfb := int64(0)
+		if tr, ok := resp.Body.(*ttfbReader); ok {
+			ttfb = tr.TTFBMs()
+		}
 		logUsage(p.usage, usageLogInput{
 			startTime: startTime, statusCode: resp.StatusCode,
 			keyName: keyName, keyHash: keyHash,
 			model: modelName, endpoint: cleanPath,
 			requestBytes: int64(len(body)), responseBytes: int64(len(errBody)),
+			ttfbMs: ttfb,
 		})
 		return
 	}
@@ -314,6 +323,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if isChatCompletions && isStreaming {
 		if rc.model.Type == config.BackendAnthropic {
 			usageData := streamChatWithThinkFilter(w, resp)
+			rc.ttfbMs = extractTTFB(resp)
 			logUsageFromChatResponse(p.usage, usageData, rc, 0)
 		} else {
 			p.streamRawResponse(w, resp, rc, true)
@@ -359,6 +369,7 @@ func (p *ProxyHandler) streamRawResponse(w http.ResponseWriter, resp *http.Respo
 	// is never blocked by capture or token extraction.
 	var capture *captureBuffer
 	var captureCh chan []byte
+	var ttfbMs atomic.Int64
 	if p.usage != nil {
 		capture = newCaptureBuffer(isStreaming)
 		captureCh = make(chan []byte, 64)
@@ -385,13 +396,19 @@ func (p *ProxyHandler) streamRawResponse(w http.ResponseWriter, resp *http.Respo
 				CacheReadTokens:  tokens.CacheReadTokens,
 				CacheWriteTokens: tokens.CacheWriteTokens,
 				DurationMS:      time.Since(rc.startTime).Milliseconds(),
+				TTFBMs:          ttfbMs.Load(),
 			})
 		}()
 	}
 
+	var firstByte atomic.Bool
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
+			if !firstByte.Load() {
+				firstByte.Store(true)
+				ttfbMs.Store(time.Since(rc.startTime).Milliseconds())
+			}
 			totalBytes.Add(int64(n))
 			if totalBytes.Load() > api.MaxResponseBodySize {
 				slog.Error("upstream response exceeded size limit", "model", rc.modelName, "bytes", totalBytes.Load())
@@ -434,6 +451,7 @@ func (p *ProxyHandler) handleNonStreamingWithSearch(w http.ResponseWriter, resp 
 		httputil.WriteError(w, http.StatusBadGateway, "failed to read upstream response")
 		return
 	}
+	rc.ttfbMs = extractTTFB(resp)
 
 	var chatResp api.ChatResponse
 	if err := json.Unmarshal(respBody, &chatResp); err != nil {
@@ -478,6 +496,7 @@ func (p *ProxyHandler) handleNonStreamingChatWithFilter(w http.ResponseWriter, r
 		httputil.WriteError(w, http.StatusBadGateway, "failed to read upstream response")
 		return
 	}
+	rc.ttfbMs = extractTTFB(resp)
 
 	// Fast path: no think tags in response, pass through unchanged.
 	if !bytes.Contains(respBody, []byte("thinking")) {
@@ -501,6 +520,7 @@ func (p *ProxyHandler) handleNonStreamingChatWithFilter(w http.ResponseWriter, r
 				totalTokens:   tokens.TotalTokens,
 				cacheReadTokens:  tokens.CacheReadTokens,
 				cacheWriteTokens: tokens.CacheWriteTokens,
+				ttfbMs:       rc.ttfbMs,
 			}, nil)
 		}
 		return
@@ -675,6 +695,7 @@ func (p *ProxyHandler) handleStreamingWithSearch(ctx context.Context, w http.Res
 		flush()
 	}
 
+	rc.ttfbMs = extractTTFB(resp)
 	logUsageFromChatResponse(p.usage, usageData, rc, responseBytes)
 }
 
@@ -701,6 +722,7 @@ func logUsageFromChatResponse(ul *usage.UsageLogger, usageData *api.ChunkUsage,
 		endpoint:      rc.endpoint,
 		requestBytes:  int64(len(rc.requestBody)),
 		responseBytes: responseBytes,
+		ttfbMs:        rc.ttfbMs,
 	}, usageData)
 }
 

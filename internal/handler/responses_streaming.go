@@ -38,6 +38,9 @@ func (h *ResponsesHandler) handleStreaming(w http.ResponseWriter, resp *http.Res
 	slog.Debug("streaming handler entered",
 		"model", req.Model, "upstream_status", resp.StatusCode, "upstream_content_type", upstreamCT)
 
+	// Wrap resp.Body with TTFB reader to capture time-to-first-byte.
+	resp.Body = newTTFBReader(resp.Body, startTime)
+
 	if !headersAlreadySent {
 		httputil.SetSecurityHeaders(w)
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -805,6 +808,7 @@ func (h *ResponsesHandler) handleStreaming(w http.ResponseWriter, resp *http.Res
 		keyName: keyName, keyHash: keyHash,
 		model: req.Model, endpoint: "/v1/responses",
 		requestBytes: requestBytes, responseBytes: responseBytes,
+		ttfbMs: extractTTFB(resp),
 	}, usageData)
 }
 

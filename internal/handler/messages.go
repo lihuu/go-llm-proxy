@@ -228,6 +228,7 @@ func (h *MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+	resp.Body = newTTFBReader(resp.Body, startTime)
 
 	if resp.StatusCode >= 400 {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, api.MaxResponseBodySize))
@@ -333,6 +334,7 @@ func (h *MessagesHandler) handleNativePassthrough(ctx context.Context, w http.Re
 		return
 	}
 	defer resp.Body.Close()
+	resp.Body = newTTFBReader(resp.Body, startTime)
 
 	// For error responses, sanitize before sending to the client.
 	if resp.StatusCode >= 400 {
@@ -346,6 +348,7 @@ func (h *MessagesHandler) handleNativePassthrough(ctx context.Context, w http.Re
 			keyName: keyName, keyHash: keyHash,
 			model: req.Model, endpoint: "/v1/messages",
 			requestBytes: int64(len(body)), responseBytes: int64(len(errBody)),
+			ttfbMs: extractTTFB(resp),
 		})
 		return
 	}
@@ -384,6 +387,7 @@ func (h *MessagesHandler) handleNativePassthrough(ctx context.Context, w http.Re
 		keyName: keyName, keyHash: keyHash,
 		model: req.Model, endpoint: "/v1/messages",
 		requestBytes: int64(len(body)), responseBytes: totalBytes,
+		ttfbMs: extractTTFB(resp),
 	})
 }
 
@@ -395,6 +399,7 @@ func (h *MessagesHandler) handleNonStreaming(w http.ResponseWriter, resp *http.R
 		httputil.WriteAnthropicError(w, http.StatusBadGateway, "api_error", "failed to read upstream response")
 		return
 	}
+	ttfb := extractTTFB(resp)
 
 	var chatResp api.ChatResponse
 	if err := json.Unmarshal(body, &chatResp); err != nil {
@@ -506,6 +511,7 @@ func (h *MessagesHandler) handleNonStreaming(w http.ResponseWriter, resp *http.R
 		keyName: keyName, keyHash: keyHash,
 		model: req.Model, endpoint: "/v1/messages",
 		requestBytes: requestBytes, responseBytes: int64(len(body)),
+		ttfbMs: ttfb,
 	}, chatResp.Usage)
 }
 
