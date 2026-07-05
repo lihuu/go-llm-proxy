@@ -321,20 +321,30 @@ func (h *MessagesHandler) handleNativePassthrough(ctx context.Context, w http.Re
 		}
 	}
 
-	slog.Info("proxying messages request (native)", "model", req.Model, "key", keyName)
+	slog.Info("proxying messages request (native)", "model", req.Model, "key", keyName, "stream", req.Stream)
 
 	resp, err := h.client.Do(upReq)
 	if err != nil {
 		if ctx.Err() != nil {
+			slog.Warn("upstream request timed out (native passthrough)",
+				"model", req.Model, "elapsed_ms", time.Since(startTime).Milliseconds(),
+				"timeout_s", model.Timeout, "error", err)
 			httputil.WriteAnthropicError(w, http.StatusGatewayTimeout, "api_error", "upstream request timed out")
 			return
 		}
-		slog.Error("upstream request failed", "error", err, "model", req.Model)
+		slog.Error("upstream request failed (native passthrough)",
+			"model", req.Model, "elapsed_ms", time.Since(startTime).Milliseconds(),
+			"error", err)
 		httputil.WriteAnthropicError(w, http.StatusBadGateway, "api_error", "upstream request failed")
 		return
 	}
 	defer resp.Body.Close()
 	resp.Body = newTTFBReader(resp.Body, startTime)
+
+	slog.Info("upstream response received (native passthrough)",
+		"model", req.Model, "status", resp.StatusCode,
+		"ttfb_ms", time.Since(startTime).Milliseconds(),
+		"content_type", resp.Header.Get("Content-Type"))
 
 	// For error responses, sanitize before sending to the client.
 	if resp.StatusCode >= 400 {
@@ -374,6 +384,8 @@ func (h *MessagesHandler) handleNativePassthrough(ctx context.Context, w http.Re
 		if n > 0 {
 			totalBytes += int64(n)
 			if totalBytes > api.MaxResponseBodySize {
+				slog.Error("response exceeded size limit (native passthrough)",
+					"model", req.Model, "bytes", totalBytes)
 				break
 			}
 			w.Write(buf[:n])
@@ -382,6 +394,12 @@ func (h *MessagesHandler) handleNativePassthrough(ctx context.Context, w http.Re
 			}
 		}
 		if readErr != nil {
+			if readErr != io.EOF {
+				slog.Error("stream interrupted (native passthrough)",
+					"model", req.Model, "bytes_sent", totalBytes,
+					"elapsed_ms", time.Since(startTime).Milliseconds(),
+					"error", readErr)
+			}
 			break
 		}
 	}

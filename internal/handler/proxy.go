@@ -273,10 +273,16 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := p.client.Do(upReq)
 	if err != nil {
 		if ctx.Err() != nil {
+			slog.Warn("upstream request timed out",
+				"model", modelName, "path", cleanPath,
+				"elapsed_ms", time.Since(startTime).Milliseconds(),
+				"timeout_s", model.Timeout, "error", err)
 			httputil.WriteError(w, http.StatusGatewayTimeout, "upstream request timed out")
 			return
 		}
-		slog.Error("upstream request failed", "error", err, "model", modelName)
+		slog.Error("upstream request failed",
+			"model", modelName, "path", cleanPath,
+			"elapsed_ms", time.Since(startTime).Milliseconds(), "error", err)
 		httputil.WriteError(w, http.StatusBadGateway, "upstream request failed")
 		return
 	}
@@ -284,6 +290,11 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Wrap the response body to capture time-to-first-byte for all paths.
 	resp.Body = newTTFBReader(resp.Body, startTime)
+
+	slog.Info("upstream response received",
+		"model", modelName, "path", cleanPath, "status", resp.StatusCode,
+		"ttfb_ms", time.Since(startTime).Milliseconds(),
+		"content_type", resp.Header.Get("Content-Type"))
 
 	isStreaming := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
 
@@ -432,6 +443,13 @@ func (p *ProxyHandler) streamRawResponse(w http.ResponseWriter, resp *http.Respo
 			}
 		}
 		if readErr != nil {
+			if readErr != io.EOF {
+				slog.Error("stream interrupted",
+					"model", rc.modelName, "endpoint", rc.endpoint,
+					"bytes_sent", totalBytes.Load(),
+					"elapsed_ms", time.Since(rc.startTime).Milliseconds(),
+					"error", readErr)
+			}
 			break
 		}
 	}

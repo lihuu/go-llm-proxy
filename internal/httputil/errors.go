@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"runtime/debug"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // SetSecurityHeaders applies standard security headers to all responses.
@@ -84,43 +86,57 @@ func RecoveryMiddleware(next http.Handler) http.Handler {
 
 // NewHTTPClient returns the standard HTTP client used for upstream calls.
 //
-// Three properties matter:
+// Design decisions:
 //
 //  1. **No redirect following.** A compromised or misconfigured backend
 //     could 3xx the proxy into an internal address; we refuse redirects
 //     outright and let the caller decide.
 //
-//  2. **Transport-level timeouts at every phase.** Go's default transport
-//     has no dial, TLS handshake, or response-header timeout, only an
-//     overall request timeout (which callers set via context). A
-//     slow-loris upstream that accepts the TCP connection then stalls
-//     headers ties up a goroutine for the full context timeout (up to
-//     300s) per in-flight request; a few parallel slow-loris targets can
-//     exhaust the server. The values here bound every phase explicitly.
+//  2. **No ResponseHeaderTimeout.** Thinking models (e.g. glm-5.2,
+//     deepseek-v4) can spend 60-120+ seconds in the thinking phase before
+//     sending the first response header. A fixed transport-level header
+//     timeout races with the per-request context timeout and kills
+//     legitimate long-thinking requests. The context timeout (set per
+//     model via the `timeout` config field) is the sole authority.
 //
-//  3. **Bounded idle-connection pool.** Prevents unbounded growth of
-//     keepalive sockets against a single upstream.
+//  3. **HTTP/2 PING keepalive.** Without explicit PING frames, idle HTTP/2
+//     connections to external backends (Ollama Cloud, etc.) can be silently
+//     dropped by intermediate NAT/firewall devices during long thinking
+//     phases. The 30s PING interval keeps the connection alive without
+//     adding per-request latency. This is the key fix for the "direct
+//     connection works but proxy disconnects" issue.
 //
-// Per-request context timeouts still apply on top for the total-request
-// bound; these transport settings just stop the connection from hanging
-// forever if the upstream misbehaves at a specific phase.
+//  4. **Bounded idle-connection pool.** Prevents unbounded growth of
+//     keepalive sockets against a single upstream. Stale connections are
+//     reaped after 60s idle — shorter than the 90s default to reduce
+//     reuse of potentially-broken connections.
 func NewHTTPClient() *http.Client {
+	transport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		IdleConnTimeout:       60 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		ForceAttemptHTTP2:     true,
+	}
+	// Configure HTTP/2 PING keepalive: send a PING frame every 30s on idle
+	// connections to detect dead connections and prevent intermediate devices
+	// (NAT, firewalls, Tailscale) from silently dropping the TCP connection
+	// during long thinking phases. This is the key fix for the "direct
+	// connection works but proxy disconnects" issue.
+	t2, err := http2.ConfigureTransports(transport)
+	if err != nil {
+		slog.Warn("failed to configure HTTP/2 PING keepalive", "error", err)
+	} else {
+		t2.ReadIdleTimeout = 30 * time.Second
+		t2.PingTimeout = 15 * time.Second
+	}
 	return &http.Client{
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   10 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: 60 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-			IdleConnTimeout:       90 * time.Second,
-			MaxIdleConns:          100,
-			MaxIdleConnsPerHost:   10,
-			// ForceAttemptHTTP2 is on by default since Go 1.13; explicit here
-			// for visibility — we do want HTTP/2 for streaming backends.
-			ForceAttemptHTTP2: true,
-		},
+		Transport: transport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
