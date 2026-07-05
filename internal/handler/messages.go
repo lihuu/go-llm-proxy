@@ -360,13 +360,17 @@ func (h *MessagesHandler) handleNativePassthrough(ctx context.Context, w http.Re
 		}
 	}
 	httputil.SetSecurityHeaders(w)
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 
+	// Stream response to client while capturing a copy for token extraction.
+	var captureBuf bytes.Buffer
+	tee := io.TeeReader(resp.Body, &captureBuf)
 	flusher, canFlush := w.(http.Flusher)
-	buf := make([]byte, 4096)
 	var totalBytes int64
+	buf := make([]byte, 4096)
 	for {
-		n, readErr := resp.Body.Read(buf)
+		n, readErr := tee.Read(buf)
 		if n > 0 {
 			totalBytes += int64(n)
 			if totalBytes > api.MaxResponseBodySize {
@@ -382,11 +386,18 @@ func (h *MessagesHandler) handleNativePassthrough(ctx context.Context, w http.Re
 		}
 	}
 
+	// Extract Anthropic-format token usage from the captured response body.
+	tokens := usage.ExtractTokenUsage(captureBuf.Bytes(), config.BackendAnthropic, false)
 	logUsage(h.usage, usageLogInput{
 		startTime: startTime, statusCode: resp.StatusCode,
 		keyName: keyName, keyHash: keyHash,
 		model: req.Model, endpoint: "/v1/messages",
 		requestBytes: int64(len(body)), responseBytes: totalBytes,
+		inputTokens:   tokens.InputTokens,
+		outputTokens:  tokens.OutputTokens,
+		totalTokens:   tokens.TotalTokens,
+		cacheReadTokens:  tokens.CacheReadTokens,
+		cacheWriteTokens: tokens.CacheWriteTokens,
 		ttfbMs: extractTTFB(resp),
 	})
 }
