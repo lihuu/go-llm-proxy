@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 
 	_ "modernc.org/sqlite"
@@ -244,19 +245,16 @@ func RunModelReport(dbPath string, days int) {
 }
 
 func formatNumber(n int64) string {
-	if n == 0 {
-		return "0"
+	switch {
+	case n >= 1_000_000:
+		s := fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+		return strings.ReplaceAll(s, ".0M", "M")
+	case n >= 1_000:
+		s := fmt.Sprintf("%.1fK", float64(n)/1_000)
+		return strings.ReplaceAll(s, ".0K", "K")
+	default:
+		return fmt.Sprintf("%d", n)
 	}
-	s := fmt.Sprintf("%d", n)
-	// Insert commas.
-	out := make([]byte, 0, len(s)+(len(s)-1)/3)
-	for i, c := range s {
-		if i > 0 && (len(s)-i)%3 == 0 {
-			out = append(out, ',')
-		}
-		out = append(out, byte(c))
-	}
-	return string(out)
 }
 
 func formatBytes(n int64) string {

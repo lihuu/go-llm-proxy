@@ -320,7 +320,9 @@ function renderTable(id,rows,cellFn){
 }
 function fmtNum(n){
 	if(typeof n!=="number")return String(n);
-	return n.toLocaleString();
+	if(n>=1000000)return (n/1000000).toFixed(1).replace(/\.0$/,"")+"M";
+	if(n>=1000)return (n/1000).toFixed(1).replace(/\.0$/,"")+"K";
+	return String(n);
 }
 function esc(s){var d=document.createElement("div");d.textContent=s;return d.innerHTML;}
 </script>
