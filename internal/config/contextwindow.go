@@ -12,9 +12,15 @@ import (
 	"go-llm-proxy/internal/httputil"
 )
 
+// ModelLimits holds the detected limits for a model from the backend.
+type ModelLimits struct {
+	ContextWindow int
+	MaxOutput     int
+}
+
 // DetectContextWindows queries each backend's models endpoint to discover
-// context window sizes. Results are stored on the ConfigStore's model entries.
-// Runs asynchronously — failures are logged but never block startup.
+// context window and max output sizes. Results are stored on the ConfigStore's
+// model entries. Runs asynchronously — failures are logged but never block startup.
 func DetectContextWindows(cs *ConfigStore) {
 	cfg := cs.Get()
 	client := httputil.NewHTTPClient()
@@ -22,87 +28,129 @@ func DetectContextWindows(cs *ConfigStore) {
 
 	for i := range cfg.Models {
 		m := &cfg.Models[i]
-		go detectOne(client, cs, m.Name, m.Backend, m.Model, m.APIKey, m.Type, m.ContextWindow)
+		go detectOne(client, cs, m.Name, m.Backend, m.Model, m.APIKey, m.Type, m.ContextWindow, m.MaxOutput)
 	}
 }
 
-// detectOne runs backend detection for a single model. Detection wins when it
-// returns a positive value (the live backend is more authoritative than a
-// hand-edited config). The configured value is the fallback: if detection
-// errors or returns 0, whatever was in config.yaml is left in place.
-func detectOne(client *http.Client, cs *ConfigStore, name, backend, modelID, apiKey, backendType string, configured int) {
-	var ctxWindow int
+// detectOne runs backend detection for a single model.
+//
+// Priority rules:
+//  1. If the user configured a value (context_window or max_output > 0), that
+//     value is used — but clamped to not exceed the backend's reported limit.
+//  2. If the user did NOT configure a value, the backend's reported value is
+//     used (auto-detect).
+//  3. If the backend doesn't report a value either, the field stays at 0
+//     (unset = no clamp / no advertised limit).
+//
+// This means a user can set context_window: 1000000 to override a backend
+// that reports 204800, but they CANNOT set context_window: 9999999 if the
+// backend reports 1000000 — it will be clamped to 1000000 with a warning.
+func detectOne(client *http.Client, cs *ConfigStore, name, backend, modelID, apiKey, backendType string, configuredCtx, configuredMaxOut int) {
+	var limits ModelLimits
 	var err error
 
 	switch backendType {
 	case BackendAnthropic:
-		ctxWindow, err = detectAnthropic(client, backend, modelID, apiKey)
+		limits, err = detectAnthropic(client, backend, modelID, apiKey)
 	case BackendBedrock:
-		// Bedrock has no API endpoint that returns model context window;
+		// Bedrock has no API endpoint that returns model limits;
 		// GetFoundationModel reports modality/region but not max tokens,
 		// and Mantle's OpenAI-compatible /v1/models omits it too. Fall
 		// back to a lookup table of well-known model-ID prefixes. On a
 		// miss we leave detection empty and let the configured value
 		// stand.
-		ctxWindow = lookupBedrockContextWindow(modelID)
+		limits.ContextWindow = lookupBedrockContextWindow(modelID)
 	default:
-		ctxWindow, err = detectOpenAI(client, backend, modelID, apiKey)
+		limits, err = detectOpenAI(client, backend, modelID, apiKey)
 	}
 
 	if err != nil {
-		if configured > 0 {
-			slog.Info("context window detection failed; keeping configured value",
-				"model", name, "configured", configured, "error", err)
+		if configuredCtx > 0 || configuredMaxOut > 0 {
+			slog.Info("model limits detection failed; keeping configured values",
+				"model", name, "error", err)
 		} else {
-			slog.Warn("failed to detect context window",
+			slog.Warn("failed to detect model limits",
 				"model", name, "backend", backend, "error", err)
 		}
 		return
 	}
-	if ctxWindow <= 0 {
-		if configured > 0 {
-			slog.Info("context window not reported by backend; keeping configured value",
-				"model", name, "configured", configured)
+
+	// Apply priority rules for context_window.
+	ctxWindow := limits.ContextWindow
+	if configuredCtx > 0 {
+		if limits.ContextWindow > 0 && configuredCtx > limits.ContextWindow {
+			slog.Warn("configured context_window exceeds backend limit; clamping",
+				"model", name, "configured", configuredCtx, "backend_limit", limits.ContextWindow)
+			ctxWindow = limits.ContextWindow
 		} else {
-			slog.Debug("backend did not report context window; set context_window in config",
-				"model", name, "backend", backend)
+			ctxWindow = configuredCtx
 		}
-		return
 	}
 
-	// Update the config under the write lock so a concurrent reload
-	// doesn't discard our result.
+	// Apply priority rules for max_output.
+	maxOutput := limits.MaxOutput
+	if configuredMaxOut > 0 {
+		if limits.MaxOutput > 0 && configuredMaxOut > limits.MaxOutput {
+			slog.Warn("configured max_output exceeds backend limit; clamping",
+				"model", name, "configured", configuredMaxOut, "backend_limit", limits.MaxOutput)
+			maxOutput = limits.MaxOutput
+		} else {
+			maxOutput = configuredMaxOut
+		}
+	}
+
+	// Update the config under the write lock.
 	cs.mu.Lock()
 	for i := range cs.config.Models {
 		if cs.config.Models[i].Name == name {
-			cs.config.Models[i].ContextWindow = ctxWindow
+			if ctxWindow > 0 {
+				cs.config.Models[i].ContextWindow = ctxWindow
+			}
+			if maxOutput > 0 {
+				cs.config.Models[i].MaxOutput = maxOutput
+			}
 			break
 		}
 	}
 	cs.mu.Unlock()
 
-	switch {
-	case configured > 0 && configured != ctxWindow:
-		slog.Info("detected context window overrides configured value",
-			"model", name, "configured", configured, "detected", ctxWindow)
-	case configured > 0:
-		slog.Info("detected context window matches configured value",
-			"model", name, "context_window", ctxWindow)
-	default:
-		slog.Info("detected context window",
-			"model", name, "context_window", ctxWindow)
+	if ctxWindow > 0 {
+		switch {
+		case configuredCtx > 0 && configuredCtx != ctxWindow:
+			slog.Info("context window clamped to backend limit",
+				"model", name, "configured", configuredCtx, "effective", ctxWindow)
+		case configuredCtx > 0:
+			slog.Info("context window matches configured value",
+				"model", name, "context_window", ctxWindow)
+		default:
+			slog.Info("detected context window",
+				"model", name, "context_window", ctxWindow)
+		}
+	}
+	if maxOutput > 0 {
+		switch {
+		case configuredMaxOut > 0 && configuredMaxOut != maxOutput:
+			slog.Info("max output clamped to backend limit",
+				"model", name, "configured", configuredMaxOut, "effective", maxOutput)
+		case configuredMaxOut > 0:
+			slog.Info("max output matches configured value",
+				"model", name, "max_output", maxOutput)
+		default:
+			slog.Info("detected max output",
+				"model", name, "max_output", maxOutput)
+		}
 	}
 }
 
 // detectOpenAI queries GET /models on an OpenAI-compatible backend and
-// extracts max_model_len from the matching model entry.
-func detectOpenAI(client *http.Client, backend, modelID, apiKey string) (int, error) {
+// extracts max_model_len and max_output_token_length from the matching model entry.
+func detectOpenAI(client *http.Client, backend, modelID, apiKey string) (ModelLimits, error) {
 	base := strings.TrimRight(backend, "/")
 
 	// Try llama.cpp /props endpoint first — it reports actual runtime n_ctx
 	// (respects --ctx-size), unlike /models which reports n_ctx_train.
 	if ctxWindow := detectLlamaCppProps(client, base, apiKey); ctxWindow > 0 {
-		return ctxWindow, nil
+		return ModelLimits{ContextWindow: ctxWindow}, nil
 	}
 
 	// Fall back to /models endpoint for other backends.
@@ -110,7 +158,7 @@ func detectOpenAI(client *http.Client, backend, modelID, apiKey string) (int, er
 
 	req, err := http.NewRequest(http.MethodGet, modelsURL, nil)
 	if err != nil {
-		return 0, err
+		return ModelLimits{}, err
 	}
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
@@ -118,17 +166,17 @@ func detectOpenAI(client *http.Client, backend, modelID, apiKey string) (int, er
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, err
+		return ModelLimits{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("models endpoint returned %d", resp.StatusCode)
+		return ModelLimits{}, fmt.Errorf("models endpoint returned %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MB limit
 	if err != nil {
-		return 0, err
+		return ModelLimits{}, err
 	}
 
 	var result struct {
@@ -139,34 +187,58 @@ func detectOpenAI(client *http.Client, backend, modelID, apiKey string) (int, er
 			Meta struct {
 				NCtxTrain int `json:"n_ctx_train"`
 			} `json:"meta"`
+			// Some providers (e.g. Ark) return token limits in a nested object.
+			TokenLimits *struct {
+				ContextWindow       int `json:"context_window"`
+				MaxOutputTokenLen   int `json:"max_output_token_length"`
+			} `json:"token_limits"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return 0, err
+		return ModelLimits{}, err
 	}
 
 	for _, m := range result.Data {
 		if m.ID == modelID {
+			limits := ModelLimits{}
 			if m.MaxModelLen > 0 {
-				return m.MaxModelLen, nil
+				limits.ContextWindow = m.MaxModelLen
+			} else if m.Meta.NCtxTrain > 0 {
+				limits.ContextWindow = m.Meta.NCtxTrain
 			}
-			if m.Meta.NCtxTrain > 0 {
-				return m.Meta.NCtxTrain, nil
+			if m.TokenLimits != nil {
+				if limits.ContextWindow <= 0 && m.TokenLimits.ContextWindow > 0 {
+					limits.ContextWindow = m.TokenLimits.ContextWindow
+				}
+				if m.TokenLimits.MaxOutputTokenLen > 0 {
+					limits.MaxOutput = m.TokenLimits.MaxOutputTokenLen
+				}
 			}
+			return limits, nil
 		}
 	}
 
 	// If only one model, use it regardless of name match.
 	if len(result.Data) == 1 {
-		if result.Data[0].MaxModelLen > 0 {
-			return result.Data[0].MaxModelLen, nil
+		m := result.Data[0]
+		limits := ModelLimits{}
+		if m.MaxModelLen > 0 {
+			limits.ContextWindow = m.MaxModelLen
+		} else if m.Meta.NCtxTrain > 0 {
+			limits.ContextWindow = m.Meta.NCtxTrain
 		}
-		if result.Data[0].Meta.NCtxTrain > 0 {
-			return result.Data[0].Meta.NCtxTrain, nil
+		if m.TokenLimits != nil {
+			if limits.ContextWindow <= 0 && m.TokenLimits.ContextWindow > 0 {
+				limits.ContextWindow = m.TokenLimits.ContextWindow
+			}
+			if m.TokenLimits.MaxOutputTokenLen > 0 {
+				limits.MaxOutput = m.TokenLimits.MaxOutputTokenLen
+			}
 		}
+		return limits, nil
 	}
 
-	return 0, fmt.Errorf("model %q not found or no context window reported", modelID)
+	return ModelLimits{}, fmt.Errorf("model %q not found or no limits reported", modelID)
 }
 
 // detectLlamaCppProps queries the llama.cpp /props endpoint to get the actual
@@ -306,14 +378,14 @@ var bedrockContextWindows = map[string]int{
 }
 
 // detectAnthropic queries GET /v1/models/{model_id} on an Anthropic backend
-// and extracts max_input_tokens.
-func detectAnthropic(client *http.Client, backend, modelID, apiKey string) (int, error) {
+// and extracts max_input_tokens and max_tokens.
+func detectAnthropic(client *http.Client, backend, modelID, apiKey string) (ModelLimits, error) {
 	base := strings.TrimRight(backend, "/")
 	modelURL := base + "/v1/models/" + modelID
 
 	req, err := http.NewRequest(http.MethodGet, modelURL, nil)
 	if err != nil {
-		return 0, err
+		return ModelLimits{}, err
 	}
 	if apiKey != "" {
 		req.Header.Set("X-Api-Key", apiKey)
@@ -322,25 +394,29 @@ func detectAnthropic(client *http.Client, backend, modelID, apiKey string) (int,
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, err
+		return ModelLimits{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("models endpoint returned %d", resp.StatusCode)
+		return ModelLimits{}, fmt.Errorf("models endpoint returned %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return 0, err
+		return ModelLimits{}, err
 	}
 
 	var result struct {
 		MaxInputTokens int `json:"max_input_tokens"`
+		MaxTokens      int `json:"max_tokens"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return 0, err
+		return ModelLimits{}, err
 	}
 
-	return result.MaxInputTokens, nil
+	return ModelLimits{
+		ContextWindow: result.MaxInputTokens,
+		MaxOutput:     result.MaxTokens,
+	}, nil
 }
