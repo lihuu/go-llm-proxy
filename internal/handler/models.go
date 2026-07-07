@@ -34,6 +34,7 @@ func (h *ModelsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Created       int64  `json:"created"`
 		OwnedBy       string `json:"owned_by"`
 		ContextWindow int    `json:"context_window,omitempty"`
+		MaxOutput     int    `json:"max_output,omitempty"`
 	}
 
 	models := make([]modelObj, 0, len(cfg.Models))
@@ -57,6 +58,7 @@ func (h *ModelsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Created:       0,
 			OwnedBy:       "organization",
 			ContextWindow: m.ContextWindow,
+			MaxOutput:     m.MaxOutput,
 		})
 	}
 
