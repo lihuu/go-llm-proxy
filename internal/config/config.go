@@ -450,6 +450,16 @@ func validateConfig(cfg *Config) error {
 			}
 		}
 
+		// Warn when max_output is unset but context_window is configured.
+		// Without max_output, the proxy won't clamp the client's max_tokens,
+		// which can cause backend 400 errors if the client sends a value
+		// exceeding the backend's output limit.
+		if m.MaxOutput <= 0 && m.ContextWindow > 0 {
+			slog.Warn("model has no max_output limit — client max_tokens will not be clamped, "+
+				"which may cause backend 400 errors if the client sends a value exceeding the backend's output limit",
+				"model", m.Name, "context_window", m.ContextWindow)
+		}
+
 		key := m.Name + ":" + m.Type
 		if seen[key] {
 			return fmt.Errorf("duplicate model %q with type %q", m.Name, m.Type)
