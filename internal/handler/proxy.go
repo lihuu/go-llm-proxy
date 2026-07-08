@@ -24,7 +24,7 @@ import (
 
 type ProxyHandler struct {
 	config   *config.ConfigStore
-	client   *http.Client
+	pool     *httputil.ClientPool
 	usage    *usage.UsageLogger // nil if logging disabled
 	pipeline *pipeline.Pipeline
 }
@@ -34,7 +34,7 @@ func NewProxyHandler(cs *config.ConfigStore, usage *usage.UsageLogger, pipeline 
 		config:   cs,
 		usage:    usage,
 		pipeline: pipeline,
-		client:   httputil.NewHTTPClient(),
+		pool:     httputil.NewClientPool(),
 	}
 }
 
@@ -270,13 +270,21 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		requestBody: body, keyName: keyName, keyHash: keyHash, startTime: startTime,
 	}
 
-	resp, err := p.client.Do(upReq)
+	resp, err := p.pool.Get(poolKey(model)).Do(upReq)
 	if err != nil {
 		if ctx.Err() != nil {
+			elapsed := time.Since(startTime).Milliseconds()
 			slog.Warn("upstream request timed out",
 				"model", modelName, "path", cleanPath,
-				"elapsed_ms", time.Since(startTime).Milliseconds(),
+				"elapsed_ms", elapsed,
 				"timeout_s", model.Timeout, "error", err)
+			// Close idle connections for this provider only to prevent
+			// HTTP/2 connection pool poisoning. When a request times out,
+			// Go's http2 transport may return the connection to the idle
+			// pool even though the server-side state is corrupted.
+			// Subsequent requests on the same connection then fail
+			// prematurely, causing cascading timeouts.
+			p.pool.CloseIdleConnections(poolKey(model))
 			httputil.WriteError(w, http.StatusGatewayTimeout, "upstream request timed out")
 			return
 		}
@@ -482,7 +490,7 @@ func (p *ProxyHandler) handleNonStreamingWithSearch(w http.ResponseWriter, resp 
 		ctx := resp.Request.Context()
 		finalResp, err := p.pipeline.HandleNonStreamingSearchLoop(ctx, chatReq, rc.model, &chatResp,
 			func(req map[string]any) (*api.ChatResponse, error) {
-				return sendChatCompletionsRequest(ctx, p.client, req, rc.model)
+				return sendChatCompletionsRequest(ctx, p.pool.Get(poolKey(rc.model)), req, rc.model)
 			}, 5)
 		if err != nil {
 			slog.Error("proxy search loop failed", "model", rc.modelName, "error", err)
@@ -769,7 +777,7 @@ func (p *ProxyHandler) reStreamFromBackend(ctx context.Context, w http.ResponseW
 		upReq.Header.Set("Authorization", "Bearer "+model.APIKey)
 	}
 
-	resp, err := p.client.Do(upReq)
+	resp, err := p.pool.Get(poolKey(model)).Do(upReq)
 	if err != nil {
 		slog.Error("proxy search re-stream: upstream failed", "error", err)
 		return

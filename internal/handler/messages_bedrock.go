@@ -67,7 +67,7 @@ func (h *MessagesHandler) handleBedrock(
 		upReq.Header.Set("X-Request-ID", requestID)
 	}
 
-	resp, err := h.client.Do(upReq)
+	resp, err := h.pool.Get(poolKey(model)).Do(upReq)
 	if err != nil {
 		if ctx.Err() != nil {
 			httputil.WriteAnthropicError(w, http.StatusGatewayTimeout, "api_error", "upstream request timed out")

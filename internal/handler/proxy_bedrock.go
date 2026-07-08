@@ -68,7 +68,7 @@ func (p *ProxyHandler) handleBedrockChat(
 	slog.Info("proxying chat completions request (bedrock)",
 		"model", modelName, "key", keyName, "stream", parsedReq.Stream, "request_id", requestID)
 
-	resp, err := p.client.Do(upReq)
+	resp, err := p.pool.Get(poolKey(model)).Do(upReq)
 	if err != nil {
 		if ctx.Err() != nil {
 			httputil.WriteError(w, http.StatusGatewayTimeout, "upstream request timed out")

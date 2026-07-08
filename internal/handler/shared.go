@@ -191,3 +191,12 @@ func runPipelineWithKeepalives(ctx context.Context, w http.ResponseWriter, pl *p
 
 	return result, true, err
 }
+
+// poolKey returns the ClientPool key for a model. Uses the provider name when
+// set, otherwise falls back to the backend URL.
+func poolKey(model *config.ModelConfig) string {
+	if model.Provider != "" {
+		return model.Provider
+	}
+	return model.Backend
+}

@@ -31,7 +31,7 @@ import (
 // "native" (always passthrough), or "translate" (always translate).
 type ResponsesHandler struct {
 	config   *config.ConfigStore
-	client   *http.Client
+	pool     *httputil.ClientPool
 	usage    *usage.UsageLogger
 	pipeline *pipeline.Pipeline
 
@@ -46,7 +46,7 @@ func NewResponsesHandler(cs *config.ConfigStore, usage *usage.UsageLogger, pipel
 		config:   cs,
 		usage:    usage,
 		pipeline: pipeline,
-		client:   httputil.NewHTTPClient(),
+		pool:     httputil.NewClientPool(),
 	}
 }
 
@@ -107,7 +107,7 @@ func (h *ResponsesHandler) tryNativePassthrough(ctx context.Context, w http.Resp
 		setAuthHeader(upReq.Header, model.APIKey, model.AuthType, model.Type)
 	}
 
-	resp, err := h.client.Do(upReq)
+	resp, err := h.pool.Get(poolKey(model)).Do(upReq)
 	if err != nil {
 		// Network error — don't cache (may be transient), let caller try translation.
 		slog.Warn("native responses probe failed", "backend", model.Backend, "error", err)
@@ -366,7 +366,7 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("proxying responses request", "model", req.Model, "key", keyName)
 
-	resp, err := h.client.Do(upReq)
+	resp, err := h.pool.Get(poolKey(model)).Do(upReq)
 	if err != nil {
 		if ctx.Err() != nil {
 			httputil.WriteError(w, http.StatusGatewayTimeout, "upstream request timed out")
@@ -579,7 +579,7 @@ func (h *ResponsesHandler) handleNonStreaming(w http.ResponseWriter, resp *http.
 }
 
 func (h *ResponsesHandler) sendChatRequest(ctx context.Context, chatReq map[string]any, model *config.ModelConfig) (*api.ChatResponse, error) {
-	return sendChatCompletionsRequest(ctx, h.client, chatReq, model)
+	return sendChatCompletionsRequest(ctx, h.pool.Get(poolKey(model)), chatReq, model)
 }
 
 // clampMaxOutputTokensInBody rewrites the max_output_tokens field in a raw

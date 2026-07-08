@@ -135,7 +135,7 @@ func (h *ResponsesHandler) HandleCompact(w http.ResponseWriter, r *http.Request)
 		setAuthHeader(upReq.Header, model.APIKey, model.AuthType, model.Type)
 	}
 
-	resp, err := h.client.Do(upReq)
+	resp, err := h.pool.Get(poolKey(model)).Do(upReq)
 	if err != nil {
 		if ctx.Err() != nil {
 			httputil.WriteError(w, http.StatusGatewayTimeout, "upstream request timed out")

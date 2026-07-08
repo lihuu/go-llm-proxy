@@ -26,7 +26,7 @@ import (
 // format automatically, enabling Claude Code to work with any backend.
 type MessagesHandler struct {
 	config   *config.ConfigStore
-	client   *http.Client
+	pool     *httputil.ClientPool
 	usage    *usage.UsageLogger
 	pipeline *pipeline.Pipeline
 }
@@ -36,7 +36,7 @@ func NewMessagesHandler(cs *config.ConfigStore, usage *usage.UsageLogger, pipeli
 		config:   cs,
 		usage:    usage,
 		pipeline: pipeline,
-		client:   httputil.NewHTTPClient(),
+		pool:     httputil.NewClientPool(),
 	}
 }
 
@@ -217,7 +217,7 @@ func (h *MessagesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		setAuthHeader(upReq.Header, model.APIKey, model.AuthType, model.Type)
 	}
 
-	resp, err := h.client.Do(upReq)
+	resp, err := h.pool.Get(poolKey(model)).Do(upReq)
 	if err != nil {
 		if ctx.Err() != nil {
 			httputil.WriteAnthropicError(w, http.StatusGatewayTimeout, "api_error", "upstream request timed out")
@@ -323,12 +323,16 @@ func (h *MessagesHandler) handleNativePassthrough(ctx context.Context, w http.Re
 
 	slog.Info("proxying messages request (native)", "model", req.Model, "key", keyName, "stream", req.Stream)
 
-	resp, err := h.client.Do(upReq)
+	resp, err := h.pool.Get(poolKey(model)).Do(upReq)
 	if err != nil {
 		if ctx.Err() != nil {
+			elapsed := time.Since(startTime).Milliseconds()
 			slog.Warn("upstream request timed out (native passthrough)",
-				"model", req.Model, "elapsed_ms", time.Since(startTime).Milliseconds(),
+				"model", req.Model, "elapsed_ms", elapsed,
 				"timeout_s", model.Timeout, "error", err)
+			// Close idle connections for this provider only to prevent
+			// HTTP/2 connection pool poisoning.
+			h.pool.CloseIdleConnections(poolKey(model))
 			httputil.WriteAnthropicError(w, http.StatusGatewayTimeout, "api_error", "upstream request timed out")
 			return
 		}
@@ -572,5 +576,5 @@ func clampMaxTokensInBody(body []byte, maxOutput int) []byte {
 }
 
 func (h *MessagesHandler) sendChatRequest(ctx context.Context, chatReq map[string]any, model *config.ModelConfig) (*api.ChatResponse, error) {
-	return sendChatCompletionsRequest(ctx, h.client, chatReq, model)
+	return sendChatCompletionsRequest(ctx, h.pool.Get(poolKey(model)), chatReq, model)
 }

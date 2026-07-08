@@ -848,7 +848,7 @@ func (h *ResponsesHandler) streamResponsesFromBackend(
 		upReq.Header.Set("Authorization", "Bearer "+model.APIKey)
 	}
 
-	resp, err := h.client.Do(upReq)
+	resp, err := h.pool.Get(poolKey(model)).Do(upReq)
 	if err != nil {
 		slog.Error("streaming search: re-send request failed", "error", err)
 		return
