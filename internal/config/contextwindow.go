@@ -1,6 +1,7 @@
 package config
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,15 +22,61 @@ type ModelLimits struct {
 // DetectContextWindows queries each backend's models endpoint to discover
 // context window and max output sizes. Results are stored on the ConfigStore's
 // model entries. Runs asynchronously — failures are logged but never block startup.
-func DetectContextWindows(cs *ConfigStore) {
+//
+// If db is non-nil, results are cached in the model_limits_cache table and
+// subsequent calls skip HTTP requests for entries that are still fresh.
+func DetectContextWindows(cs *ConfigStore, db *sql.DB) {
+	if db != nil {
+		if err := initModelLimitsCache(db); err != nil {
+			slog.Warn("failed to init model limits cache; detection will run uncached", "error", err)
+			db = nil
+		}
+	}
+
 	cfg := cs.Get()
 	client := httputil.NewHTTPClient()
 	client.Timeout = 10 * time.Second
 
 	for i := range cfg.Models {
 		m := &cfg.Models[i]
-		go detectOne(client, cs, m.Name, m.Backend, m.Model, m.APIKey, m.Type, m.ContextWindow, m.MaxOutput)
+
+		// If the user explicitly configured both values, skip detection entirely.
+		if m.ContextWindow > 0 && m.MaxOutput > 0 {
+			continue
+		}
+
+		// Check cache before making HTTP requests.
+		if db != nil {
+			cached, err := lookupModelLimitsCache(db, m.Name, m.Backend, m.Model, m.Type)
+			if err != nil {
+				slog.Warn("model limits cache lookup failed", "model", m.Name, "error", err)
+			} else if cached != nil {
+				applyCachedLimits(cs, m.Name, cached)
+				continue
+			}
+		}
+
+		go detectOne(client, cs, db, m.Name, m.Backend, m.Model, m.APIKey, m.Type, m.ContextWindow, m.MaxOutput)
 	}
+}
+
+// applyCachedLimits writes cached values into the ConfigStore model entry.
+func applyCachedLimits(cs *ConfigStore, name string, cached *cachedModelLimits) {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	for i := range cs.config.Models {
+		if cs.config.Models[i].Name == name {
+			if cached.ContextWindow > 0 && cs.config.Models[i].ContextWindow <= 0 {
+				cs.config.Models[i].ContextWindow = cached.ContextWindow
+			}
+			if cached.MaxOutput > 0 && cs.config.Models[i].MaxOutput <= 0 {
+				cs.config.Models[i].MaxOutput = cached.MaxOutput
+			}
+			break
+		}
+	}
+	slog.Debug("applied cached model limits", "model", name,
+		"context_window", cached.ContextWindow, "max_output", cached.MaxOutput)
 }
 
 // detectOne runs backend detection for a single model.
@@ -45,7 +92,7 @@ func DetectContextWindows(cs *ConfigStore) {
 // This means a user can set context_window: 1000000 to override a backend
 // that reports 204800, but they CANNOT set context_window: 9999999 if the
 // backend reports 1000000 — it will be clamped to 1000000 with a warning.
-func detectOne(client *http.Client, cs *ConfigStore, name, backend, modelID, apiKey, backendType string, configuredCtx, configuredMaxOut int) {
+func detectOne(client *http.Client, cs *ConfigStore, db *sql.DB, name, backend, modelID, apiKey, backendType string, configuredCtx, configuredMaxOut int) {
 	var limits ModelLimits
 	var err error
 
@@ -139,6 +186,14 @@ func detectOne(client *http.Client, cs *ConfigStore, name, backend, modelID, api
 			slog.Info("detected max output",
 				"model", name, "max_output", maxOutput)
 		}
+	}
+
+	// Save to cache so subsequent startups skip the HTTP request.
+	if db != nil {
+		saveModelLimitsCache(db, name, backend, modelID, backendType, ModelLimits{
+			ContextWindow: ctxWindow,
+			MaxOutput:     maxOutput,
+		})
 	}
 }
 

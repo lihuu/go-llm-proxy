@@ -1,11 +1,15 @@
 package config
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestDetectOpenAI(t *testing.T) {
@@ -135,7 +139,7 @@ func TestDetectContextWindows_SkipsConfigured(t *testing.T) {
 	cs := &ConfigStore{config: cfg}
 
 	// Should not attempt any network calls (backend is unreachable).
-	DetectContextWindows(cs)
+	DetectContextWindows(cs, nil)
 
 	// Values should be unchanged.
 	model := cs.Get().Models[0]
@@ -144,5 +148,133 @@ func TestDetectContextWindows_SkipsConfigured(t *testing.T) {
 	}
 	if model.MaxOutput != 50000 {
 		t.Fatalf("expected configured max_output preserved, got %d", model.MaxOutput)
+	}
+}
+
+func TestDetectContextWindows_SkipsWhenBothConfigured(t *testing.T) {
+	// When both context_window and max_output are > 0, detection is skipped
+	// entirely — no cache lookup, no HTTP request.
+	cfg := &Config{
+		Models: []ModelConfig{
+			{Name: "full-config", Backend: "http://localhost:9999/v1", Model: "full-config", ContextWindow: 100000, MaxOutput: 50000, Timeout: 300},
+		},
+	}
+	cs := &ConfigStore{config: cfg}
+	DetectContextWindows(cs, nil)
+
+	model := cs.Get().Models[0]
+	if model.ContextWindow != 100000 {
+		t.Fatalf("expected context_window 100000, got %d", model.ContextWindow)
+	}
+	if model.MaxOutput != 50000 {
+		t.Fatalf("expected max_output 50000, got %d", model.MaxOutput)
+	}
+}
+
+func TestDetectContextWindows_CacheHit(t *testing.T) {
+	// Use a temp file for the SQLite database.
+	f, err := os.CreateTemp("", "limits-cache-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp db: %v", err)
+	}
+	dbPath := f.Name()
+	f.Close()
+	defer os.Remove(dbPath)
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := initModelLimitsCache(db); err != nil {
+		t.Fatalf("failed to init cache: %v", err)
+	}
+
+	// Pre-populate a cache entry. The Type must match the model config below.
+	saveModelLimitsCache(db, "cached-model", "http://localhost:9999/v1", "cached-model", "openai", ModelLimits{
+		ContextWindow: 65536,
+		MaxOutput:     16384,
+	})
+
+	cfg := &Config{
+		Models: []ModelConfig{
+			{Name: "cached-model", Backend: "http://localhost:9999/v1", Model: "cached-model", Type: "openai", Timeout: 300},
+		},
+	}
+	cs := &ConfigStore{config: cfg}
+
+	// Should use cache, not make HTTP requests (backend is unreachable).
+	DetectContextWindows(cs, db)
+
+	// Give goroutines a moment to finish.
+	time.Sleep(100 * time.Millisecond)
+
+	model := cs.Get().Models[0]
+	if model.ContextWindow != 65536 {
+		t.Fatalf("expected context_window 65536 from cache, got %d", model.ContextWindow)
+	}
+	if model.MaxOutput != 16384 {
+		t.Fatalf("expected max_output 16384 from cache, got %d", model.MaxOutput)
+	}
+}
+
+func TestDetectContextWindows_CacheMissFallsBackToHTTP(t *testing.T) {
+	// Use a temp file for the SQLite database.
+	f, err := os.CreateTemp("", "limits-cache-*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp db: %v", err)
+	}
+	dbPath := f.Name()
+	f.Close()
+	defer os.Remove(dbPath)
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	if err := initModelLimitsCache(db); err != nil {
+		t.Fatalf("failed to init cache: %v", err)
+	}
+
+	// Start a test server that returns limits.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": []map[string]any{
+				{"id": "uncached-model", "max_model_len": 131072},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	cfg := &Config{
+		Models: []ModelConfig{
+			{Name: "uncached-model", Backend: ts.URL + "/v1", Model: "uncached-model", Type: "openai", Timeout: 300},
+		},
+	}
+	cs := &ConfigStore{config: cfg}
+
+	DetectContextWindows(cs, db)
+
+	// Give goroutines a moment to finish.
+	time.Sleep(500 * time.Millisecond)
+
+	model := cs.Get().Models[0]
+	if model.ContextWindow != 131072 {
+		t.Fatalf("expected context_window 131072 from HTTP, got %d", model.ContextWindow)
+	}
+
+	// Verify the result was cached.
+	cached, err := lookupModelLimitsCache(db, "uncached-model", ts.URL+"/v1", "uncached-model", "openai")
+	if err != nil {
+		t.Fatalf("cache lookup failed: %v", err)
+	}
+	if cached == nil {
+		t.Fatal("expected cache entry after detection, got nil")
+	}
+	if cached.ContextWindow != 131072 {
+		t.Fatalf("expected cached context_window 131072, got %d", cached.ContextWindow)
 	}
 }

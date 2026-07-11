@@ -148,6 +148,16 @@ func (ul *UsageLogger) Close() error {
 	return err1
 }
 
+// DB returns the underlying write database handle, or nil if the logger was
+// not initialized. This is used by config.DetectContextWindows to cache
+// model limits detection results.
+func (ul *UsageLogger) DB() *sql.DB {
+	if ul == nil {
+		return nil
+	}
+	return ul.db
+}
+
 type DashboardData struct {
 	Totals      DashboardTotals `json:"totals"`
 	Daily       []DailyRow      `json:"daily"`

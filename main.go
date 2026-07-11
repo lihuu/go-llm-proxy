@@ -111,7 +111,7 @@ func main() {
 	}
 
 	// Auto-detect context window sizes from backends (async, non-blocking).
-	config.DetectContextWindows(cs)
+	config.DetectContextWindows(cs, ul.DB())
 
 	// Start health checker for model availability tracking.
 	healthStore := config.NewHealthStore(cs, 30*time.Second, 5*time.Second)
@@ -139,7 +139,7 @@ func main() {
 		if dashRl != nil {
 			dashRl.SetTrustedProxies(newCfg.TrustedProxies)
 		}
-		config.DetectContextWindows(cs)
+		config.DetectContextWindows(cs, ul.DB())
 	})
 
 	// Watch config file for changes (auto-reload on save).
