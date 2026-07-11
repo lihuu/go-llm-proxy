@@ -441,3 +441,168 @@ func TestClampMaxTokens_NoClampWhenBelowLimit(t *testing.T) {
 		t.Fatalf("expected 32000 unchanged, got %v", req["max_tokens"])
 	}
 }
+
+// --- Model group validation tests ---
+
+func TestValidateConfig_ModelGroupValid(t *testing.T) {
+	cfg := validConfig()
+	cfg.Providers = []ProviderConfig{
+		{Name: "p1", Backend: "http://p1/v1", Type: "openai"},
+		{Name: "p2", Backend: "http://p2/v1", Type: "openai"},
+	}
+	cfg.ModelGroups = []ModelGroupConfig{
+		{
+			Name:     "my-group",
+			Strategy: "sequential",
+			Members: []ModelGroupMember{
+				{Provider: "p1", Model: "model-a"},
+				{Provider: "p2", Model: "model-b"},
+			},
+		},
+	}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+}
+
+func TestValidateConfig_ModelGroupMissingName(t *testing.T) {
+	cfg := validConfig()
+	cfg.Providers = []ProviderConfig{{Name: "p1", Backend: "http://p1/v1"}}
+	cfg.ModelGroups = []ModelGroupConfig{
+		{Name: "", Members: []ModelGroupMember{{Provider: "p1", Model: "m"}}},
+	}
+	err := validateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "missing name") {
+		t.Fatalf("expected missing name error, got: %v", err)
+	}
+}
+
+func TestValidateConfig_ModelGroupDuplicateName(t *testing.T) {
+	cfg := validConfig()
+	cfg.Providers = []ProviderConfig{{Name: "p1", Backend: "http://p1/v1"}}
+	cfg.ModelGroups = []ModelGroupConfig{
+		{Name: "dup", Members: []ModelGroupMember{{Provider: "p1", Model: "m"}}},
+		{Name: "dup", Members: []ModelGroupMember{{Provider: "p1", Model: "m"}}},
+	}
+	err := validateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "duplicate model_group") {
+		t.Fatalf("expected duplicate model_group error, got: %v", err)
+	}
+}
+
+func TestValidateConfig_ModelGroupConflictsWithModel(t *testing.T) {
+	cfg := validConfig()
+	cfg.Providers = []ProviderConfig{{Name: "p1", Backend: "http://p1/v1"}}
+	cfg.ModelGroups = []ModelGroupConfig{
+		{Name: "test-model", Members: []ModelGroupMember{{Provider: "p1", Model: "m"}}},
+	}
+	err := validateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "conflicts with an existing model") {
+		t.Fatalf("expected conflict error, got: %v", err)
+	}
+}
+
+func TestValidateConfig_ModelGroupUnknownStrategy(t *testing.T) {
+	cfg := validConfig()
+	cfg.Providers = []ProviderConfig{{Name: "p1", Backend: "http://p1/v1"}}
+	cfg.ModelGroups = []ModelGroupConfig{
+		{Name: "g", Strategy: "round-robin", Members: []ModelGroupMember{{Provider: "p1", Model: "m"}}},
+	}
+	err := validateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "unknown strategy") {
+		t.Fatalf("expected unknown strategy error, got: %v", err)
+	}
+}
+
+func TestValidateConfig_ModelGroupNoMembers(t *testing.T) {
+	cfg := validConfig()
+	cfg.ModelGroups = []ModelGroupConfig{
+		{Name: "g", Members: nil},
+	}
+	err := validateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "no members") {
+		t.Fatalf("expected no members error, got: %v", err)
+	}
+}
+
+func TestValidateConfig_ModelGroupMissingProvider(t *testing.T) {
+	cfg := validConfig()
+	cfg.ModelGroups = []ModelGroupConfig{
+		{Name: "g", Members: []ModelGroupMember{{Provider: "", Model: "m"}}},
+	}
+	err := validateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "missing provider") {
+		t.Fatalf("expected missing provider error, got: %v", err)
+	}
+}
+
+func TestValidateConfig_ModelGroupMissingModel(t *testing.T) {
+	cfg := validConfig()
+	cfg.Providers = []ProviderConfig{{Name: "p1", Backend: "http://p1/v1"}}
+	cfg.ModelGroups = []ModelGroupConfig{
+		{Name: "g", Members: []ModelGroupMember{{Provider: "p1", Model: ""}}},
+	}
+	err := validateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "missing model") {
+		t.Fatalf("expected missing model error, got: %v", err)
+	}
+}
+
+func TestValidateConfig_ModelGroupUnknownProvider(t *testing.T) {
+	cfg := validConfig()
+	cfg.ModelGroups = []ModelGroupConfig{
+		{Name: "g", Members: []ModelGroupMember{{Provider: "nonexistent", Model: "m"}}},
+	}
+	err := validateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "unknown provider") {
+		t.Fatalf("expected unknown provider error, got: %v", err)
+	}
+}
+
+// --- Provider status validation tests ---
+
+func TestValidateConfig_ProviderStatusDown(t *testing.T) {
+	cfg := validConfig()
+	cfg.Providers = []ProviderConfig{
+		{Name: "p1", Backend: "http://p1/v1", Status: "down"},
+	}
+	// Provider status "down" is valid.
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("expected no error for status=down, got: %v", err)
+	}
+}
+
+func TestValidateConfig_ProviderStatusInvalid(t *testing.T) {
+	cfg := validConfig()
+	cfg.Providers = []ProviderConfig{
+		{Name: "p1", Backend: "http://p1/v1", Status: "bogus"},
+	}
+	err := validateConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "unknown status") {
+		t.Fatalf("expected unknown status error, got: %v", err)
+	}
+}
+
+// --- FindModelGroup tests ---
+
+func TestFindModelGroup_Found(t *testing.T) {
+	cfg := &Config{
+		ModelGroups: []ModelGroupConfig{
+			{Name: "g1"},
+			{Name: "g2"},
+		},
+	}
+	if g := FindModelGroup(cfg, "g1"); g == nil {
+		t.Fatal("expected to find g1")
+	}
+	if g := FindModelGroup(cfg, "g2"); g == nil {
+		t.Fatal("expected to find g2")
+	}
+}
+
+func TestFindModelGroup_NotFound(t *testing.T) {
+	cfg := &Config{}
+	if g := FindModelGroup(cfg, "nonexistent"); g != nil {
+		t.Fatal("expected nil for nonexistent group")
+	}
+}

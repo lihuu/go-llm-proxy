@@ -30,10 +30,11 @@ import (
 // Backends can control this via responses_mode in config: "auto" (default),
 // "native" (always passthrough), or "translate" (always translate).
 type ResponsesHandler struct {
-	config   *config.ConfigStore
-	pool     *httputil.ClientPool
-	usage    *usage.UsageLogger
-	pipeline *pipeline.Pipeline
+	config        *config.ConfigStore
+	pool          *httputil.ClientPool
+	usage         *usage.UsageLogger
+	pipeline      *pipeline.Pipeline
+	groupResolver *config.GroupResolver
 
 	// nativeCache tracks which backend+path combinations support native
 	// Responses API endpoints. Key: "backendURL\x00path", Value: bool.
@@ -41,12 +42,13 @@ type ResponsesHandler struct {
 	nativeCache sync.Map
 }
 
-func NewResponsesHandler(cs *config.ConfigStore, usage *usage.UsageLogger, pipeline *pipeline.Pipeline) *ResponsesHandler {
+func NewResponsesHandler(cs *config.ConfigStore, usage *usage.UsageLogger, pipeline *pipeline.Pipeline, groupResolver *config.GroupResolver) *ResponsesHandler {
 	return &ResponsesHandler{
-		config:   cs,
-		usage:    usage,
-		pipeline: pipeline,
-		pool:     httputil.NewClientPool(),
+		config:        cs,
+		usage:         usage,
+		pipeline:      pipeline,
+		pool:          httputil.NewClientPool(),
+		groupResolver: groupResolver,
 	}
 }
 
@@ -261,6 +263,16 @@ func (h *ResponsesHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		keyHash = usage.HashKey(key.Key)
 	}
 	startTime := time.Now()
+
+	// Check if this is a model group (virtual model). If so, delegate to
+	// the group resolver for member selection and failover.
+	if h.groupResolver != nil {
+		if groupModel, memberIdx, gErr := h.groupResolver.Resolve(req.Model, config.BackendOpenAI); gErr == nil {
+			model = groupModel
+			h.serveGroupRequest(w, r, body, req, model, memberIdx, key, keyName, keyHash, startTime)
+			return
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(model.Timeout)*time.Second)
 	defer cancel()
@@ -605,4 +617,208 @@ func clampMaxOutputTokensInBody(body []byte, maxOutput int) []byte {
 	m["max_output_tokens"] = json.RawMessage(newVal)
 	out, _ := json.Marshal(m)
 	return out
+}
+
+// serveGroupRequest handles a Responses API request for a model group,
+// iterating through members in order and falling back on retryable failures.
+func (h *ResponsesHandler) serveGroupRequest(w http.ResponseWriter, r *http.Request, body []byte,
+	req responsesRequest, firstModel *config.ModelConfig, firstMemberIdx int,
+	key *config.KeyConfig, keyName, keyHash string, startTime time.Time) {
+
+	cfg := h.config.Get()
+	group := config.FindModelGroup(cfg, req.Model)
+	if group == nil {
+		httputil.WriteError(w, http.StatusNotFound, "unknown model")
+		return
+	}
+
+	type memberAttempt struct {
+		model       *config.ModelConfig
+		memberIndex int
+	}
+	members := make([]memberAttempt, 0, len(group.Members))
+	members = append(members, memberAttempt{model: firstModel, memberIndex: firstMemberIdx})
+
+	for i := range group.Members {
+		if i == firstMemberIdx {
+			continue
+		}
+		m, _, err := h.groupResolver.ResolveByIndex(req.Model, i, config.BackendOpenAI)
+		if err != nil {
+			continue
+		}
+		members = append(members, memberAttempt{model: m, memberIndex: i})
+	}
+
+	var lastErr error
+
+	for attempt, ma := range members {
+		if attempt > 0 {
+			slog.Info("group failover: trying next member",
+				"group", req.Model, "member_index", ma.memberIndex,
+				"provider", ma.model.Provider, "model", ma.model.Model)
+		}
+
+		success, statusCode := h.tryGroupMember(w, r, body, req, ma.model, key, keyName, keyHash, startTime)
+		if success {
+			h.groupResolver.RecordSuccess(req.Model, ma.memberIndex)
+			return
+		}
+
+		lastErr = fmt.Errorf("member %d failed with status %d", ma.memberIndex, statusCode)
+		h.groupResolver.RecordFailure(req.Model, ma.memberIndex, statusCode)
+	}
+
+	slog.Error("all group members failed",
+		"group", req.Model, "members", len(members), "last_error", lastErr)
+	httputil.WriteError(w, http.StatusBadGateway,
+		fmt.Sprintf("all backends failed for model %q", req.Model))
+}
+
+// tryGroupMember attempts to dispatch a Responses API request to a single
+// group member. Returns (true, 0) on success, (false, statusCode) on
+// retryable failure.
+func (h *ResponsesHandler) tryGroupMember(w http.ResponseWriter, r *http.Request, body []byte,
+	req responsesRequest, model *config.ModelConfig,
+	key *config.KeyConfig, keyName, keyHash string, startTime time.Time) (bool, int) {
+
+	if model.Type == config.BackendAnthropic {
+		return false, http.StatusBadRequest
+	}
+	if model.Type == config.BackendBedrock {
+		return false, http.StatusBadRequest
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(model.Timeout)*time.Second)
+	defer cancel()
+
+	// Try native passthrough unless forced to translate.
+	if !h.shouldTranslate(model, "/responses") {
+		if h.tryNativePassthrough(ctx, w, r, body, req.Model, model, "/responses", keyName, keyHash, startTime) {
+			return true, 0
+		}
+		if h.shouldForceNative(model) {
+			return false, http.StatusBadGateway
+		}
+	}
+
+	// Translate Responses API -> Chat Completions.
+	slog.Info("proxying responses request (translated)", "model", req.Model, "key", keyName)
+
+	messages, err := translateInput(req.Input, req.Instructions)
+	if err != nil {
+		slog.Error("responses input translation failed", "model", req.Model, "error", err)
+		return false, http.StatusBadRequest
+	}
+
+	chatReq := buildChatRequest(req, model.Model, messages)
+
+	// Run pipeline pre-send processors.
+	headersAlreadySent := false
+	if h.pipeline != nil && h.pipeline.ShouldProcess(model) {
+		if req.Stream && pipeline.RequestContainsImageURLs(chatReq) {
+			chatReq, headersAlreadySent, err = runPipelineWithKeepalives(ctx, w, h.pipeline, chatReq, model)
+		} else {
+			chatReq, err = h.pipeline.ProcessRequest(ctx, chatReq, model)
+		}
+		if err != nil {
+			if headersAlreadySent {
+				failedData, _ := json.Marshal(map[string]any{
+					"type": "response.failed",
+					"response": map[string]any{
+						"id":     api.RandomID("resp_"),
+						"object": "response",
+						"model":  req.Model,
+						"status": "failed",
+						"error": map[string]any{
+							"type":    "server_error",
+							"message": "internal processing error",
+						},
+						"output": []any{},
+					},
+					"sequence_number": 0,
+				})
+				fmt.Fprintf(w, "event: response.failed\ndata: %s\n\n", failedData)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}
+			return false, http.StatusInternalServerError
+		}
+	}
+
+	if ctx.Err() != nil {
+		slog.Warn("client disconnected during pipeline processing",
+			"model", req.Model, "key", keyName, "error", ctx.Err())
+		return false, http.StatusGatewayTimeout
+	}
+
+	// Clamp max_tokens.
+	model.ClampMaxTokens(chatReq)
+
+	chatBody, err := json.Marshal(chatReq)
+	if err != nil {
+		return false, http.StatusInternalServerError
+	}
+
+	upstreamURL := strings.TrimRight(model.Backend, "/") + api.ChatCompletionsPath
+
+	upReq, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(chatBody))
+	if err != nil {
+		return false, http.StatusInternalServerError
+	}
+	upReq.Header.Set("Content-Type", "application/json")
+	if req.Stream {
+		upReq.Header.Set("Accept", "text/event-stream")
+	}
+	if v := r.Header.Get("X-Request-ID"); v != "" {
+		upReq.Header.Set("X-Request-ID", v)
+	}
+	if model.APIKey != "" {
+		setAuthHeader(upReq.Header, model.APIKey, model.AuthType, model.Type)
+	}
+
+	slog.Info("proxying group member responses request",
+		"group", req.Model, "member_provider", model.Provider,
+		"member_model", model.Model, "key", keyName)
+
+	resp, err := h.pool.Get(poolKey(model)).Do(upReq)
+	if err != nil {
+		if ctx.Err() != nil {
+			elapsed := time.Since(startTime).Milliseconds()
+			slog.Warn("group member request timed out",
+				"group", req.Model, "member_provider", model.Provider,
+				"elapsed_ms", elapsed, "timeout_s", model.Timeout, "error", err)
+			h.pool.CloseIdleConnections(poolKey(model))
+			return false, http.StatusGatewayTimeout
+		}
+		slog.Error("group member request failed",
+			"group", req.Model, "member_provider", model.Provider,
+			"elapsed_ms", time.Since(startTime).Milliseconds(), "error", err)
+		return false, http.StatusBadGateway
+	}
+	defer resp.Body.Close()
+	resp.Body = newTTFBReader(resp.Body, startTime)
+
+	// Retryable HTTP errors: 5xx and 429.
+	if resp.StatusCode >= 400 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, api.MaxResponseBodySize))
+		slog.Error("group member returned error",
+			"group", req.Model, "member_provider", model.Provider,
+			"status", resp.StatusCode, "body", string(errBody))
+		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+			return false, resp.StatusCode
+		}
+		// Non-retryable 4xx: write error to client.
+		httputil.WriteError(w, resp.StatusCode, fmt.Sprintf("backend returned HTTP %d", resp.StatusCode))
+		return true, 0
+	}
+
+	reqBytes := int64(len(chatBody))
+	if req.Stream {
+		h.handleStreaming(w, resp, req, model, chatReq, reqBytes, keyName, keyHash, startTime, false)
+	} else {
+		h.handleNonStreaming(w, resp, req, model, chatReq, reqBytes, keyName, keyHash, startTime)
+	}
+	return true, 0
 }

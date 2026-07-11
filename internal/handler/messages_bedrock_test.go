@@ -30,7 +30,7 @@ func newBedrockTestHandler(t *testing.T, modelID string, upstream http.HandlerFu
 		}},
 	}
 	cs := config.NewTestConfigStore(cfg)
-	return NewMessagesHandler(cs, nil, nil), ts
+	return NewMessagesHandler(cs, nil, nil, nil), ts
 }
 
 func TestBedrockHandler_NonStreaming(t *testing.T) {
@@ -170,7 +170,7 @@ func TestBedrockHandler_BedrockAPIKeyAuth(t *testing.T) {
 			APIKey:  "bdrk-secret-key",
 		}},
 	}
-	handler := NewMessagesHandler(config.NewTestConfigStore(cfg), nil, nil)
+	handler := NewMessagesHandler(config.NewTestConfigStore(cfg), nil, nil, nil)
 
 	body := `{"model":"claude-bedrock","max_tokens":10,"messages":[{"role":"user","content":"Hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
@@ -199,7 +199,7 @@ func TestBedrockHandler_UpstreamError(t *testing.T) {
 			AWSAccessKey: "k", AWSSecretKey: "s",
 		}},
 	}
-	handler := NewMessagesHandler(config.NewTestConfigStore(cfg), nil, nil)
+	handler := NewMessagesHandler(config.NewTestConfigStore(cfg), nil, nil, nil)
 
 	body := `{"model":"claude-bedrock","max_tokens":10,"messages":[{"role":"user","content":"Hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))

@@ -28,7 +28,7 @@ func newBedrockProxyHandler(t *testing.T, modelID string, upstream http.HandlerF
 		}},
 	}
 	cs := config.NewTestConfigStore(cfg)
-	return NewProxyHandler(cs, nil, nil), ts
+	return NewProxyHandler(cs, nil, nil, nil), ts
 }
 
 func TestProxyBedrock_NonStreaming(t *testing.T) {
@@ -280,7 +280,7 @@ func TestProxyBedrock_BedrockAPIKeyAuth(t *testing.T) {
 			APIKey: "bdrk-key",
 		}},
 	}
-	handler := NewProxyHandler(config.NewTestConfigStore(cfg), nil, nil)
+	handler := NewProxyHandler(config.NewTestConfigStore(cfg), nil, nil, nil)
 
 	body := `{"model":"claude-bedrock","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
@@ -304,7 +304,7 @@ func TestProxyBedrock_RejectsNonChatCompletionsPath(t *testing.T) {
 			AWSAccessKey: "k", AWSSecretKey: "s",
 		}},
 	}
-	handler := NewProxyHandler(config.NewTestConfigStore(cfg), nil, nil)
+	handler := NewProxyHandler(config.NewTestConfigStore(cfg), nil, nil, nil)
 
 	// Use /v1/embeddings (allowed by AllowedPaths but not chat/completions)
 	// to verify the bedrock-specific path check fires before the generic
@@ -337,7 +337,7 @@ func TestProxyBedrock_UpstreamErrorSanitized(t *testing.T) {
 			AWSAccessKey: "k", AWSSecretKey: "s",
 		}},
 	}
-	handler := NewProxyHandler(config.NewTestConfigStore(cfg), nil, nil)
+	handler := NewProxyHandler(config.NewTestConfigStore(cfg), nil, nil, nil)
 
 	body := `{"model":"claude-bedrock","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))

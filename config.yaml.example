@@ -9,6 +9,27 @@
 # For local-only testing: use ":8080".
 listen: ":8080"
 
+# ── Providers ──────────────────────────────────────────────────────────────────
+# Named provider definitions that models and model groups can reference.
+# A model inherits the provider's backend, api_key, type, and other
+# connection-level settings, and can override any of them.
+# providers:
+#   - name: my-local
+#     backend: http://192.168.1.10:8000/v1
+#     # api_key: backend-key
+#     # type: openai
+#
+#   - name: anthropic
+#     backend: https://api.anthropic.com
+#     api_key: sk-ant-your-key
+#     type: anthropic
+#     # status: down              # manually mark this provider as unavailable
+#
+#   - name: deepseek
+#     backend: https://api.deepseek.com/v1
+#     api_key: sk-your-deepseek-key
+#     type: openai
+
 # ── Models ─────────────────────────────────────────────────────────────────────
 # Each model gets a name that clients use, and a backend URL where requests are sent.
 # The proxy auto-detects the protocol and translates as needed.
@@ -118,6 +139,28 @@ keys:
 # App isolation: each app's vectors are tagged with its name on write,
 # and filtered to only return its own data on search. Transparent to clients.
 # Access via /qdrant/* with Authorization: Bearer <app_key>
+
+# ── Model Groups ────────────────────────────────────────────────────────────────
+# Virtual models that aggregate multiple provider backends under a single name.
+# The proxy selects a member according to the configured strategy and falls
+# back to the next member on failure (connection errors, timeouts, HTTP 5xx).
+# HTTP 429 (quota exhausted) triggers a longer cooldown before retrying.
+#
+# Members reference named providers (see the providers section above) and
+# specify the actual model name sent to that provider's backend.
+#
+# model_groups:
+#   - name: my-ai                    # virtual model name exposed to clients
+#     strategy: sequential           # routing strategy (default: sequential)
+#     members:
+#       - provider: anthropic        # references a ProviderConfig name
+#         model: claude-sonnet-4-20250514  # model name sent to this provider
+#       - provider: deepseek
+#         model: deepseek-chat
+#     circuit_breaker:
+#       failure_threshold: 3         # consecutive failures before tripping (default: 3)
+#       recovery_seconds: 30         # cooldown for regular failures (default: 30)
+#       quota_cooldown_minutes: 60   # cooldown for HTTP 429 (default: 60)
 
 # ── Network ────────────────────────────────────────────────────────────────────
 # IPs allowed to set X-Real-IP / X-Forwarded-For (for rate limiting behind a proxy).

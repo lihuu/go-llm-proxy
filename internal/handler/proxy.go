@@ -23,18 +23,20 @@ import (
 )
 
 type ProxyHandler struct {
-	config   *config.ConfigStore
-	pool     *httputil.ClientPool
-	usage    *usage.UsageLogger // nil if logging disabled
-	pipeline *pipeline.Pipeline
+	config        *config.ConfigStore
+	pool          *httputil.ClientPool
+	usage         *usage.UsageLogger // nil if logging disabled
+	pipeline      *pipeline.Pipeline
+	groupResolver *config.GroupResolver
 }
 
-func NewProxyHandler(cs *config.ConfigStore, usage *usage.UsageLogger, pipeline *pipeline.Pipeline) *ProxyHandler {
+func NewProxyHandler(cs *config.ConfigStore, usage *usage.UsageLogger, pipeline *pipeline.Pipeline, groupResolver *config.GroupResolver) *ProxyHandler {
 	return &ProxyHandler{
-		config:   cs,
-		usage:    usage,
-		pipeline: pipeline,
-		pool:     httputil.NewClientPool(),
+		config:        cs,
+		usage:         usage,
+		pipeline:      pipeline,
+		pool:          httputil.NewClientPool(),
+		groupResolver: groupResolver,
 	}
 }
 
@@ -112,6 +114,16 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if model == nil {
 		// Fallback: try without type hint (backward compat).
 		model = config.FindModel(cfg, modelName)
+	}
+	if model == nil && p.groupResolver != nil {
+		// Try resolving as a model group.
+		groupModel, memberIdx, gErr := p.groupResolver.Resolve(modelName, typeHint)
+		if gErr == nil {
+			model = groupModel
+			// Wrap the request in a retry loop for group failover.
+			p.serveGroupRequest(w, r, body, modelName, model, memberIdx, cleanPath, requireAnthropic, isMultipart, contentType, key, typeHint)
+			return
+		}
 	}
 	if model == nil {
 		httputil.WriteError(w, http.StatusNotFound, "unknown model")
@@ -786,4 +798,299 @@ func (p *ProxyHandler) reStreamFromBackend(ctx context.Context, w http.ResponseW
 
 	// Use the think tag filter for re-streamed content.
 	reStreamWithThinkFilter(w, resp.Body, flusher, canFlush)
+}
+
+// serveGroupRequest handles a request for a model group, iterating through
+// members in order and falling back on retryable failures (connection errors,
+// timeouts, HTTP 5xx, HTTP 429).
+func (p *ProxyHandler) serveGroupRequest(w http.ResponseWriter, r *http.Request, body []byte,
+	modelName string, firstModel *config.ModelConfig, firstMemberIdx int,
+	cleanPath string, requireAnthropic bool, isMultipart bool, contentType string,
+	key *config.KeyConfig, typeHint string) {
+
+	cfg := p.config.Get()
+	group := config.FindModelGroup(cfg, modelName)
+	if group == nil {
+		httputil.WriteError(w, http.StatusNotFound, "unknown model")
+		return
+	}
+
+	// Build the ordered list of members to try.
+	type memberAttempt struct {
+		model       *config.ModelConfig
+		memberIndex int
+	}
+	members := make([]memberAttempt, 0, len(group.Members))
+	members = append(members, memberAttempt{model: firstModel, memberIndex: firstMemberIdx})
+
+	// Resolve remaining members. We iterate by index and skip the first one.
+	for i := range group.Members {
+		if i == firstMemberIdx {
+			continue
+		}
+		m, _, err := p.groupResolver.ResolveByIndex(modelName, i, typeHint)
+		if err != nil {
+			continue
+		}
+		members = append(members, memberAttempt{model: m, memberIndex: i})
+	}
+
+	var lastErr error
+
+	for attempt, ma := range members {
+		if attempt > 0 {
+			slog.Info("group failover: trying next member",
+				"group", modelName, "member_index", ma.memberIndex,
+				"provider", ma.model.Provider, "model", ma.model.Model)
+		}
+
+		success, statusCode := p.tryGroupMember(w, r, body, modelName, ma.model, cleanPath,
+			requireAnthropic, isMultipart, contentType, key)
+		if success {
+			// Request completed successfully (response already written to w).
+			p.groupResolver.RecordSuccess(modelName, ma.memberIndex)
+			return
+		}
+
+		lastErr = fmt.Errorf("member %d failed with status %d", ma.memberIndex, statusCode)
+		p.groupResolver.RecordFailure(modelName, ma.memberIndex, statusCode)
+	}
+
+	// All members failed.
+	slog.Error("all group members failed",
+		"group", modelName, "members", len(members), "last_error", lastErr)
+	httputil.WriteError(w, http.StatusBadGateway,
+		fmt.Sprintf("all backends failed for model %q", modelName))
+}
+
+// tryGroupMember attempts to send a request to a single group member.
+// Returns (true, 0) on success (response already written to w), or
+// (false, statusCode) on failure.
+func (p *ProxyHandler) tryGroupMember(w http.ResponseWriter, r *http.Request, body []byte,
+	modelName string, model *config.ModelConfig,
+	cleanPath string, requireAnthropic bool, isMultipart bool, contentType string,
+	key *config.KeyConfig) (bool, int) {
+
+	// Re-read body for each attempt (body is a fresh copy from the caller).
+	currentBody := body
+
+	// Model name rewrite.
+	if model.Model != modelName {
+		if isMultipart {
+			currentBody = RewriteModelInMultipart(currentBody, contentType, model.Model)
+		} else {
+			currentBody = RewriteModelName(currentBody, model.Model)
+		}
+	}
+
+	// AWS Bedrock dispatch.
+	if model.Type == config.BackendBedrock {
+		if cleanPath != "/v1/chat/completions" {
+			return false, http.StatusBadRequest
+		}
+		if isMultipart {
+			return false, http.StatusBadRequest
+		}
+		keyName := ""
+		keyHash := ""
+		if key != nil {
+			keyName = key.Name
+			keyHash = usage.HashKey(key.Key)
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), time.Duration(model.Timeout)*time.Second)
+		defer cancel()
+		p.handleBedrockChat(ctx, w, currentBody, modelName, model, keyName, keyHash,
+			r.Header.Get("X-Request-ID"), time.Now())
+		return true, 0
+	}
+
+	// Pipeline + search.
+	isChatCompletions := cleanPath == "/v1/chat/completions" && !isMultipart
+	var parsedChatReq map[string]any
+
+	if p.pipeline != nil && isChatCompletions && p.pipeline.BodyNeedsProcessing(currentBody) {
+		if err := json.Unmarshal(currentBody, &parsedChatReq); err != nil {
+			slog.Warn("pipeline: failed to parse request body for processing", "error", err)
+		} else {
+			processed, pErr := p.pipeline.ProcessRequest(r.Context(), parsedChatReq, model)
+			if pErr != nil {
+				slog.Warn("pipeline: processing failed, sending original request", "error", pErr)
+			} else {
+				parsedChatReq = processed
+				if newBody, mErr := json.Marshal(processed); mErr != nil {
+					slog.Error("pipeline: failed to re-marshal processed request", "error", mErr)
+				} else {
+					currentBody = newBody
+				}
+			}
+		}
+	}
+
+	// Check if post-response search is possible.
+	searchEnabled := false
+	if p.pipeline != nil && isChatCompletions && p.pipeline.ResolveWebSearchKey(model) != "" {
+		if parsedChatReq != nil {
+			searchEnabled = true
+		} else if err := json.Unmarshal(currentBody, &parsedChatReq); err == nil {
+			searchEnabled = true
+		}
+	}
+
+	// Apply model's default sampling parameters.
+	if isChatCompletions && model.Defaults != nil {
+		if parsedChatReq == nil {
+			if err := json.Unmarshal(currentBody, &parsedChatReq); err != nil {
+				slog.Warn("failed to parse chat request for defaults", "error", err)
+			}
+		}
+		if parsedChatReq != nil {
+			model.ApplySamplingDefaults(parsedChatReq)
+			if newBody, err := json.Marshal(parsedChatReq); err == nil {
+				currentBody = newBody
+			}
+		}
+	}
+
+	// Clamp max_tokens.
+	if isChatCompletions && model.MaxOutput > 0 {
+		if parsedChatReq == nil {
+			if err := json.Unmarshal(currentBody, &parsedChatReq); err != nil {
+				slog.Warn("failed to parse chat request for max_tokens clamp", "error", err)
+			}
+		}
+		if parsedChatReq != nil {
+			model.ClampMaxTokens(parsedChatReq)
+			if newBody, err := json.Marshal(parsedChatReq); err == nil {
+				currentBody = newBody
+			}
+		}
+	}
+
+	// Build upstream URL.
+	relPath := cleanPath
+	if model.Type == config.BackendAnthropic {
+		if strings.HasSuffix(strings.TrimRight(model.Backend, "/"), "/v1") {
+			relPath = strings.TrimPrefix(cleanPath, "/v1")
+		}
+	} else {
+		relPath = strings.TrimPrefix(cleanPath, "/v1")
+	}
+	upstreamURL := strings.TrimRight(model.Backend, "/") + relPath
+
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(model.Timeout)*time.Second)
+	defer cancel()
+
+	upReq, err := http.NewRequestWithContext(ctx, r.Method, upstreamURL, bytes.NewReader(currentBody))
+	if err != nil {
+		slog.Error("failed to create upstream request", "error", err)
+		return false, http.StatusInternalServerError
+	}
+
+	copyHeaders(upReq.Header, r.Header, model.Type)
+	if model.APIKey != "" {
+		setAuthHeader(upReq.Header, model.APIKey, model.AuthType, model.Type)
+	}
+
+	keyName := ""
+	keyHash := ""
+	if key != nil {
+		keyName = key.Name
+		keyHash = usage.HashKey(key.Key)
+	}
+	slog.Info("proxying group member request",
+		"group", modelName, "member_provider", model.Provider,
+		"member_model", model.Model, "path", cleanPath, "key", keyName)
+
+	startTime := time.Now()
+	rc := proxyRequestContext{
+		model: model, modelName: modelName, endpoint: cleanPath,
+		requestBody: currentBody, keyName: keyName, keyHash: keyHash, startTime: startTime,
+	}
+
+	resp, err := p.pool.Get(poolKey(model)).Do(upReq)
+	if err != nil {
+		if ctx.Err() != nil {
+			elapsed := time.Since(startTime).Milliseconds()
+			slog.Warn("group member request timed out",
+				"group", modelName, "member_provider", model.Provider,
+				"elapsed_ms", elapsed, "timeout_s", model.Timeout, "error", err)
+			p.pool.CloseIdleConnections(poolKey(model))
+			return false, http.StatusGatewayTimeout
+		}
+		slog.Error("group member request failed",
+			"group", modelName, "member_provider", model.Provider,
+			"elapsed_ms", time.Since(startTime).Milliseconds(), "error", err)
+		return false, http.StatusBadGateway
+	}
+	defer resp.Body.Close()
+
+	// Wrap the response body to capture time-to-first-byte.
+	resp.Body = newTTFBReader(resp.Body, startTime)
+
+	slog.Info("group member response received",
+		"group", modelName, "member_provider", model.Provider,
+		"status", resp.StatusCode,
+		"ttfb_ms", time.Since(startTime).Milliseconds())
+
+	isStreaming := strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream")
+
+	copyResponseHeaders(w, resp)
+	httputil.SetSecurityHeaders(w)
+
+	// Retryable HTTP errors: 5xx and 429.
+	if resp.StatusCode >= 400 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, api.MaxResponseBodySize))
+		slog.Error("group member returned error",
+			"group", modelName, "member_provider", model.Provider,
+			"status", resp.StatusCode, "body", string(errBody))
+
+		ttfb := int64(0)
+		if tr, ok := resp.Body.(*ttfbReader); ok {
+			ttfb = tr.TTFBMs()
+		}
+		logUsage(p.usage, usageLogInput{
+			startTime: startTime, statusCode: resp.StatusCode,
+			keyName: keyName, keyHash: keyHash,
+			model: modelName, endpoint: cleanPath,
+			requestBytes: int64(len(currentBody)), responseBytes: int64(len(errBody)),
+			ttfbMs: ttfb,
+		})
+
+		// 5xx and 429 are retryable; 4xx (except 429) are not.
+		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+			return false, resp.StatusCode
+		}
+		// Non-retryable 4xx: write error to client and stop.
+		httputil.WriteError(w, resp.StatusCode, fmt.Sprintf("backend returned HTTP %d", resp.StatusCode))
+		return true, 0
+	}
+
+	if searchEnabled && !isStreaming {
+		p.handleNonStreamingWithSearch(w, resp, parsedChatReq, rc)
+		return true, 0
+	}
+	if searchEnabled && isStreaming {
+		p.handleStreamingWithSearch(ctx, w, resp, parsedChatReq, rc)
+		return true, 0
+	}
+
+	// For Chat Completions (without search), filter  thinking tags from content.
+	if isChatCompletions && isStreaming {
+		if rc.model.Type == config.BackendAnthropic {
+			usageData := streamChatWithThinkFilter(w, resp)
+			rc.ttfbMs = extractTTFB(resp)
+			logUsageFromChatResponse(p.usage, usageData, rc, 0)
+		} else {
+			p.streamRawResponse(w, resp, rc, true)
+		}
+		return true, 0
+	}
+	if isChatCompletions && !isStreaming {
+		p.handleNonStreamingChatWithFilter(w, resp, rc)
+		return true, 0
+	}
+
+	w.WriteHeader(resp.StatusCode)
+	p.streamRawResponse(w, resp, rc, isStreaming)
+	return true, 0
 }

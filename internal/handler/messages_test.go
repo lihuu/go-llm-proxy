@@ -641,7 +641,7 @@ func newTestMessagesHandler(t *testing.T, modelType string, upstream http.Handle
 		}},
 	}
 	cs := config.NewTestConfigStore(cfg)
-	return NewMessagesHandler(cs, nil, nil), ts
+	return NewMessagesHandler(cs, nil, nil, nil), ts
 }
 
 func TestMessagesHandler_NonStreaming(t *testing.T) {
@@ -1004,7 +1004,7 @@ func TestMessagesHandler_TranslateModeSkipsProbe(t *testing.T) {
 		}},
 	}
 	cs := config.NewTestConfigStore(cfg)
-	handler := NewMessagesHandler(cs, nil, nil)
+	handler := NewMessagesHandler(cs, nil, nil, nil)
 
 	body := `{"model":"test-model","max_tokens":100,"messages":[{"role":"user","content":"Hello"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
@@ -1350,7 +1350,7 @@ func TestMessagesHandler_StreamingSearchLoop(t *testing.T) {
 	}
 	cs := config.NewTestConfigStore(cfg)
 	pl := pipeline.NewPipeline(cs, http.DefaultClient)
-	h := NewMessagesHandler(cs, nil, pl)
+	h := NewMessagesHandler(cs, nil, pl, nil)
 
 	// Send a request with web_search server tool.
 	body := `{"model":"test-model","max_tokens":1000,"stream":true,"messages":[{"role":"user","content":"Search for something"}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}`
@@ -1434,7 +1434,7 @@ func TestMessagesHandler_NonStreamingSearchLoop(t *testing.T) {
 	}
 	cs := config.NewTestConfigStore(cfg)
 	pl := pipeline.NewPipeline(cs, http.DefaultClient)
-	h := NewMessagesHandler(cs, nil, pl)
+	h := NewMessagesHandler(cs, nil, pl, nil)
 
 	body := `{"model":"test-model","max_tokens":1000,"messages":[{"role":"user","content":"Search"}],"tools":[{"type":"web_search_20250305","name":"web_search"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
@@ -1513,7 +1513,7 @@ func TestMessagesHandler_MixedToolCalls(t *testing.T) {
 	}
 	cs := config.NewTestConfigStore(cfg)
 	pl := pipeline.NewPipeline(cs, http.DefaultClient)
-	h := NewMessagesHandler(cs, nil, pl)
+	h := NewMessagesHandler(cs, nil, pl, nil)
 
 	body := `{"model":"test-model","max_tokens":1000,"messages":[{"role":"user","content":"Search and run"}],"tools":[{"type":"web_search_20250305","name":"web_search"},{"name":"bash","description":"Run bash","input_schema":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))

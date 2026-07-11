@@ -37,7 +37,7 @@ func (h *ModelsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		MaxOutput     int    `json:"max_output,omitempty"`
 	}
 
-	models := make([]modelObj, 0, len(cfg.Models))
+	models := make([]modelObj, 0, len(cfg.Models)+len(cfg.ModelGroups))
 	seen := make(map[string]bool)
 	for _, m := range cfg.Models {
 		if !auth.KeyAllowsModel(key, m.Name) {
@@ -59,6 +59,24 @@ func (h *ModelsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			OwnedBy:       "organization",
 			ContextWindow: m.ContextWindow,
 			MaxOutput:     m.MaxOutput,
+		})
+	}
+
+	// Add model group names to the list. Groups are virtual models that
+	// aggregate multiple backends; they appear as regular models to clients.
+	for _, g := range cfg.ModelGroups {
+		if !auth.KeyAllowsModel(key, g.Name) {
+			continue
+		}
+		if seen[g.Name] {
+			continue
+		}
+		seen[g.Name] = true
+		models = append(models, modelObj{
+			ID:      g.Name,
+			Object:  "model",
+			Created: 0,
+			OwnedBy: "organization",
 		})
 	}
 

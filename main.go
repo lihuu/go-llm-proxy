@@ -119,9 +119,12 @@ func main() {
 	// Create the processing pipeline (shared by all handlers).
 	pl := pipeline.NewPipeline(cs, httputil.NewHTTPClient())
 
-	proxy := handler.NewProxyHandler(cs, ul, pl)
-	responses := handler.NewResponsesHandler(cs, ul, pl)
-	messages := handler.NewMessagesHandler(cs, ul, pl)
+	// Create the group resolver for model group aggregation/failover.
+	groupResolver := config.NewGroupResolver(cs)
+
+	proxy := handler.NewProxyHandler(cs, ul, pl, groupResolver)
+	responses := handler.NewResponsesHandler(cs, ul, pl, groupResolver)
+	messages := handler.NewMessagesHandler(cs, ul, pl, groupResolver)
 	models := handler.NewModelsHandler(cs, healthStore)
 	rl := ratelimit.NewRateLimiter(cfg.TrustedProxies)
 

@@ -25,6 +25,7 @@ type Config struct {
 	Models                 []ModelConfig    `yaml:"models"`
 	Keys                   []KeyConfig      `yaml:"keys"`
 	Providers              []ProviderConfig `yaml:"providers"`              // named provider definitions (shared backend/api_key)
+	ModelGroups            []ModelGroupConfig `yaml:"model_groups"`           // virtual model groups for aggregation/failover
 	Services               ServicesConfig   `yaml:"services"`               // external service proxies (Qdrant, etc.)
 	Processors             ProcessorsConfig `yaml:"processors"`             // global processor defaults
 	TrustedProxies         []string         `yaml:"trusted_proxies"`        // CIDR or IPs allowed to set X-Real-IP
@@ -33,6 +34,32 @@ type Config struct {
 	UsageDB                string           `yaml:"usage_db"`                 // path to SQLite usage database (default: usage.db)
 	UsageDashboard         bool             `yaml:"usage_dashboard"`          // enable the usage dashboard at /usage
 	UsageDashboardPassword string           `yaml:"usage_dashboard_password"` // password for the usage dashboard
+}
+
+// ModelGroupConfig defines a virtual model that aggregates multiple provider
+// backends under a single name. The proxy selects a member according to the
+// configured strategy (e.g. "sequential") and falls back to the next member
+// on failure.
+type ModelGroupConfig struct {
+	Name           string             `yaml:"name"`     // virtual model name exposed to clients
+	Strategy       string             `yaml:"strategy"` // routing strategy: "sequential" (default)
+	Members        []ModelGroupMember `yaml:"members"`
+	CircuitBreaker *CBSettings        `yaml:"circuit_breaker,omitempty"` // optional breaker tuning
+}
+
+// ModelGroupMember defines a single backend within a model group.
+// The provider field references a named ProviderConfig; the model field is
+// the actual model name sent to that provider's backend.
+type ModelGroupMember struct {
+	Provider string `yaml:"provider"` // references a ProviderConfig name
+	Model    string `yaml:"model"`    // model name sent to the backend
+}
+
+// CBSettings configures circuit-breaker behaviour for a model group.
+type CBSettings struct {
+	FailureThreshold     int `yaml:"failure_threshold"`      // consecutive failures before tripping (default: 3)
+	RecoverySeconds      int `yaml:"recovery_seconds"`       // seconds before probing after a regular failure (default: 30)
+	QuotaCooldownMinutes int `yaml:"quota_cooldown_minutes"` // minutes before probing after a 429 (default: 60)
 }
 
 // ProviderConfig defines a named provider that can be referenced by models
@@ -44,6 +71,7 @@ type ProviderConfig struct {
 	APIKey string `yaml:"api_key"`
 	Type   string `yaml:"type"` // "", "openai" (default), "anthropic", or "bedrock"
 	AuthType string `yaml:"auth_type"` // "auto" (default), "bearer", or "x-api-key"
+	Status string `yaml:"status"` // "" (default/up) or "down" (manually marked unavailable)
 
 	// AWS Bedrock fields (only used when type: "bedrock").
 	Region          string `yaml:"region"`
@@ -364,6 +392,16 @@ func FindModel(cfg *Config, name string, typeHint ...string) *ModelConfig {
 	return nil
 }
 
+// FindModelGroup returns the ModelGroupConfig matching the given name, or nil.
+func FindModelGroup(cfg *Config, name string) *ModelGroupConfig {
+	for i := range cfg.ModelGroups {
+		if cfg.ModelGroups[i].Name == name {
+			return &cfg.ModelGroups[i]
+		}
+	}
+	return nil
+}
+
 func validateConfig(cfg *Config) error {
 	if len(cfg.Keys) == 0 {
 		slog.Warn("no API keys configured — all requests will be unauthenticated")
@@ -467,11 +505,71 @@ func validateConfig(cfg *Config) error {
 		seen[key] = true
 	}
 
+	// Validate model groups.
+	groupNames := make(map[string]bool)
+	for _, g := range cfg.ModelGroups {
+		if g.Name == "" {
+			return fmt.Errorf("model_group entry missing name")
+		}
+		if groupNames[g.Name] {
+			return fmt.Errorf("duplicate model_group %q", g.Name)
+		}
+		groupNames[g.Name] = true
+
+		// Group name must not conflict with a model name.
+		if seen[g.Name+":"] {
+			return fmt.Errorf("model_group %q conflicts with an existing model name", g.Name)
+		}
+
+		switch g.Strategy {
+		case "", "sequential":
+		default:
+			return fmt.Errorf("model_group %q has unknown strategy %q (must be %q)", g.Name, g.Strategy, "sequential")
+		}
+
+		if len(g.Members) == 0 {
+			return fmt.Errorf("model_group %q has no members", g.Name)
+		}
+
+		for i, member := range g.Members {
+			if member.Provider == "" {
+				return fmt.Errorf("model_group %q member %d missing provider", g.Name, i)
+			}
+			if member.Model == "" {
+				return fmt.Errorf("model_group %q member %d missing model", g.Name, i)
+			}
+			// Verify the provider exists.
+			found := false
+			for _, p := range cfg.Providers {
+				if p.Name == member.Provider {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("model_group %q member %d references unknown provider %q", g.Name, i, member.Provider)
+			}
+		}
+	}
+
+	// Validate provider status values.
+	for _, p := range cfg.Providers {
+		switch p.Status {
+		case "", "down":
+		default:
+			return fmt.Errorf("provider %q has unknown status %q (must be %q or %q)", p.Name, p.Status, "", "down")
+		}
+	}
+
 	// Build a name-only set for processor reference checks (processors reference
-	// models by name, not by name+type).
+	// models by name, not by name+type). Also includes group names so that
+	// key permissions can reference virtual model names.
 	allNames := make(map[string]bool)
 	for _, m := range cfg.Models {
 		allNames[m.Name] = true
+	}
+	for _, g := range cfg.ModelGroups {
+		allNames[g.Name] = true
 	}
 
 	// Validate global vision processor references a defined model.

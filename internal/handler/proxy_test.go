@@ -175,7 +175,7 @@ func newTestProxyHandler(t *testing.T, modelType string, upstream http.HandlerFu
 		},
 	}
 	cs := config.NewTestConfigStore(cfg)
-	return NewProxyHandler(cs, nil, nil), ts
+	return NewProxyHandler(cs, nil, nil, nil), ts
 }
 
 func TestProxyHandler_OpenAIAuthHeader(t *testing.T) {
@@ -234,7 +234,7 @@ func newTestProxyHandlerWithSearch(t *testing.T, upstream http.HandlerFunc) (*Pr
 	}
 	cs := config.NewTestConfigStore(cfg)
 	pl := pipeline.NewPipeline(cs, http.DefaultClient)
-	return NewProxyHandler(cs, nil, pl), ts
+	return NewProxyHandler(cs, nil, pl, nil), ts
 }
 
 func TestProxyHandler_StreamingPassthrough_NoToolCalls(t *testing.T) {

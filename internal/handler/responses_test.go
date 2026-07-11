@@ -375,7 +375,7 @@ func newTestResponsesHandler(t *testing.T, upstream http.HandlerFunc) (*Response
 		},
 	}
 	cs := config.NewTestConfigStore(cfg)
-	return NewResponsesHandler(cs, nil, nil), ts
+	return NewResponsesHandler(cs, nil, nil, nil), ts
 }
 
 func TestResponsesHandler_NonStreaming(t *testing.T) {
@@ -623,7 +623,7 @@ func TestResponsesHandler_RejectsAnthropicBackend(t *testing.T) {
 		},
 	}
 	cs := config.NewTestConfigStore(cfg)
-	handler := NewResponsesHandler(cs, nil, nil)
+	handler := NewResponsesHandler(cs, nil, nil, nil)
 
 	body := `{"model":"claude-test","input":"Hello","stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
@@ -643,7 +643,7 @@ func TestResponsesHandler_UnknownModel(t *testing.T) {
 		},
 	}
 	cs := config.NewTestConfigStore(cfg)
-	handler := NewResponsesHandler(cs, nil, nil)
+	handler := NewResponsesHandler(cs, nil, nil, nil)
 
 	body := `{"model":"nonexistent","input":"Hello","stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
@@ -659,7 +659,7 @@ func TestResponsesHandler_UnknownModel(t *testing.T) {
 func TestResponsesHandler_MissingModel(t *testing.T) {
 	cfg := &config.Config{}
 	cs := config.NewTestConfigStore(cfg)
-	handler := NewResponsesHandler(cs, nil, nil)
+	handler := NewResponsesHandler(cs, nil, nil, nil)
 
 	body := `{"input":"Hello","stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
@@ -675,7 +675,7 @@ func TestResponsesHandler_MissingModel(t *testing.T) {
 func TestResponsesHandler_MethodNotAllowed(t *testing.T) {
 	cfg := &config.Config{}
 	cs := config.NewTestConfigStore(cfg)
-	handler := NewResponsesHandler(cs, nil, nil)
+	handler := NewResponsesHandler(cs, nil, nil, nil)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
 	w := httptest.NewRecorder()
@@ -787,7 +787,7 @@ func TestResponsesHandler_NativePassthrough(t *testing.T) {
 		}},
 	}
 	cs := config.NewTestConfigStore(cfg)
-	handler := NewResponsesHandler(cs, nil, nil)
+	handler := NewResponsesHandler(cs, nil, nil, nil)
 
 	body := `{"model":"test-model","input":"Hello","stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
@@ -835,7 +835,7 @@ func TestResponsesHandler_FallbackOn404(t *testing.T) {
 		}},
 	}
 	cs := config.NewTestConfigStore(cfg)
-	handler := NewResponsesHandler(cs, nil, nil)
+	handler := NewResponsesHandler(cs, nil, nil, nil)
 
 	body := `{"model":"test-model","input":"Hello","stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
@@ -892,7 +892,7 @@ func TestResponsesHandler_TranslateModeSkipsProbe(t *testing.T) {
 		}},
 	}
 	cs := config.NewTestConfigStore(cfg)
-	handler := NewResponsesHandler(cs, nil, nil)
+	handler := NewResponsesHandler(cs, nil, nil, nil)
 
 	body := `{"model":"test-model","input":"Hello","stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
@@ -922,7 +922,7 @@ func TestResponsesHandler_NativeModeNoFallback(t *testing.T) {
 		}},
 	}
 	cs := config.NewTestConfigStore(cfg)
-	handler := NewResponsesHandler(cs, nil, nil)
+	handler := NewResponsesHandler(cs, nil, nil, nil)
 
 	body := `{"model":"test-model","input":"Hello","stream":false}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
@@ -954,7 +954,7 @@ func TestHandleCompact_NativePassthrough(t *testing.T) {
 		}},
 	}
 	cs := config.NewTestConfigStore(cfg)
-	handler := NewResponsesHandler(cs, nil, nil)
+	handler := NewResponsesHandler(cs, nil, nil, nil)
 
 	body := `{"model":"test-model","input":[{"role":"user","content":"Hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(body))
@@ -1066,7 +1066,7 @@ func TestHandleCompact_RejectsAnthropicBackend(t *testing.T) {
 		}},
 	}
 	cs := config.NewTestConfigStore(cfg)
-	handler := NewResponsesHandler(cs, nil, nil)
+	handler := NewResponsesHandler(cs, nil, nil, nil)
 
 	body := `{"model":"claude-test","input":[{"role":"user","content":"Hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(body))
