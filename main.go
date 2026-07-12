@@ -243,6 +243,16 @@ func main() {
 		sig := <-quit
 		slog.Info("shutting down", "signal", sig.String())
 
+		// Disable keep-alives first so that idle HTTP/2 connections receive
+		// a GOAWAY frame and HTTP/1.1 connections get "Connection: close".
+		// This lets clients (e.g. Node.js undici / OpenAI SDK) learn that the
+		// connection is going away *before* the TCP socket is closed, so
+		// they don't try to reuse a dead connection on the next request and
+		// hit a 30s+ socket-level timeout. Give them a brief grace period to
+		// notice before we force-close.
+		srv.SetKeepAlivesEnabled(false)
+		time.Sleep(2 * time.Second)
+
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		if err := srv.Shutdown(ctx); err != nil {

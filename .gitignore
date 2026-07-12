@@ -13,3 +13,4 @@ opencode-dev/
 rtx6kpro/
 .gitignore
 usage.db
+.zcode/
