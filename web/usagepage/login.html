@@ -1,167 +1,11 @@
-package handler
-
-import (
-	"encoding/json"
-	"html"
-	"html/template"
-	"log/slog"
-	"net/http"
-	"strconv"
-
-	"go-llm-proxy/internal/config"
-	"go-llm-proxy/internal/httputil"
-	"go-llm-proxy/internal/ratelimit"
-	"go-llm-proxy/internal/usage"
-	"go-llm-proxy/web"
-)
-
-const dashboardCookieName = "usage_auth"
-
-type UsageDashboardHandler struct {
-	config   *config.ConfigStore
-	usage    *usage.UsageLogger
-	rl       *ratelimit.RateLimiter
-	sessions *sessionStore
-}
-
-func NewUsageDashboardHandler(cs *config.ConfigStore, ul *usage.UsageLogger, rl *ratelimit.RateLimiter) *UsageDashboardHandler {
-	return &UsageDashboardHandler{
-		config:   cs,
-		usage:    ul,
-		rl:       rl,
-		sessions: newSessionStore(),
-	}
-}
-
-func (h *UsageDashboardHandler) LoginPage(w http.ResponseWriter, r *http.Request) {
-	if h.checkCookie(r) {
-		h.renderDashboard(w)
-		return
-	}
-	h.renderLogin(w, "")
-}
-
-func (h *UsageDashboardHandler) HandleLogin(w http.ResponseWriter, r *http.Request) {
-	ip := ratelimit.ClientIP(h.rl, r)
-	if !h.rl.Check(ip) {
-		httputil.WriteError(w, http.StatusTooManyRequests, "too many attempts")
-		return
-	}
-	if err := r.ParseForm(); err != nil {
-		httputil.WriteError(w, http.StatusBadRequest, "bad request")
-		return
-	}
-	password := r.FormValue("password")
-	cfg := h.config.Get()
-	if !constantTimeEqual(password, cfg.UsageDashboardPassword) {
-		h.rl.RecordFailure(ip)
-		h.renderLogin(w, "Incorrect password")
-		return
-	}
-	token := h.sessions.create()
-	if token == "" {
-		httputil.WriteError(w, http.StatusInternalServerError, "session creation failed")
-		return
-	}
-	h.setCookie(w, r, token)
-	http.Redirect(w, r, "/usage", http.StatusSeeOther)
-}
-
-// HandleLogout revokes the caller's session and clears the cookie.
-func (h *UsageDashboardHandler) HandleLogout(w http.ResponseWriter, r *http.Request) {
-	if cookie, err := r.Cookie(dashboardCookieName); err == nil {
-		h.sessions.revoke(cookie.Value)
-	}
-	// Expire the cookie on the client too.
-	http.SetCookie(w, &http.Cookie{
-		Name:     dashboardCookieName,
-		Value:    "",
-		Path:     "/usage",
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		Secure:   requestIsTLS(r, h.rl),
-		MaxAge:   -1,
-	})
-	http.Redirect(w, r, "/usage", http.StatusSeeOther)
-}
-
-func (h *UsageDashboardHandler) ServeData(w http.ResponseWriter, r *http.Request) {
-	if !h.checkCookie(r) {
-		httputil.WriteError(w, http.StatusUnauthorized, "not authenticated")
-		return
-	}
-	days := 30
-	if d := r.URL.Query().Get("days"); d != "" {
-		if v, err := strconv.Atoi(d); err == nil && v > 0 && v <= 365 {
-			days = v
-		}
-	}
-	data, err := h.usage.QueryDashboardData(days)
-	if err != nil {
-		slog.Error("dashboard query failed", "error", err)
-		httputil.WriteError(w, http.StatusInternalServerError, "query failed")
-		return
-	}
-	httputil.SetSecurityHeaders(w)
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
-	json.NewEncoder(w).Encode(data)
-}
-
-func (h *UsageDashboardHandler) checkCookie(r *http.Request) bool {
-	cookie, err := r.Cookie(dashboardCookieName)
-	if err != nil {
-		return false
-	}
-	return h.sessions.validate(cookie.Value)
-}
-
-func (h *UsageDashboardHandler) setCookie(w http.ResponseWriter, r *http.Request, token string) {
-	http.SetCookie(w, &http.Cookie{
-		Name:     dashboardCookieName,
-		Value:    token,
-		Path:     "/usage",
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-		Secure:   requestIsTLS(r, h.rl),
-		MaxAge:   int(dashboardSessionTTL.Seconds()),
-	})
-}
-
-func (h *UsageDashboardHandler) renderLogin(w http.ResponseWriter, errMsg string) {
-	httputil.SetSecurityHeaders(w)
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	errNotice := ""
-	if errMsg != "" {
-		errNotice = `<div class="error-notice">` + html.EscapeString(errMsg) + `</div>`
-	}
-	tmpl, err := template.ParseFS(web.FS, "usagepage/login.html")
-	if err != nil {
-		slog.Error("failed to parse login template", "error", err)
-		httputil.WriteError(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	if err := tmpl.Execute(w, map[string]template.HTML{"ErrNotice": template.HTML(errNotice)}); err != nil {
-		slog.Error("failed to render login page", "error", err)
-	}
-}
-
-func (h *UsageDashboardHandler) renderDashboard(w http.ResponseWriter) {
-	httputil.SetSecurityHeaders(w)
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	data, err := web.FS.ReadFile("usagepage/dashboard.html")
-	if err != nil {
-		slog.Error("failed to read dashboard template", "error", err)
-		httputil.WriteError(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	w.Write(data)
-}
-
-func dashboardCSS() string {
-	return `*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Usage Dashboard</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
   --bg:#f4f6f9;--surface:#fff;--border:#d8dde5;
   --text:#1b2033;--muted:#5c6377;
@@ -225,5 +69,25 @@ select{padding:6px 10px;font-size:.88rem;border:1px solid var(--border);border-r
 .bar-segment{width:100%;min-height:1px;transition:height .3s}
 .bar-segment:first-child{border-radius:3px 3px 0 0}
 .bar-label{font-size:.65rem;color:var(--muted);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;text-align:center}
-@media(max-width:600px){.container{padding:14px 12px 48px}.card{padding:16px}.summary-cards{grid-template-columns:1fr 1fr}.bars{height:150px}}`
-}
+@media(max-width:600px){.container{padding:14px 12px 48px}.card{padding:16px}.summary-cards{grid-template-columns:1fr 1fr}.bars{height:150px}}
+</style>
+</head>
+<body>
+<div class="header"><div class="header-inner"><h1>Usage Dashboard</h1></div></div>
+<div class="container">
+<div class="card" style="max-width:420px;margin:40px auto">
+<h2>Sign In</h2>
+{{.ErrNotice}}
+<form method="POST" action="/usage">
+<div class="field">
+<label for="password">Password</label>
+<input type="password" id="password" name="password" autofocus autocomplete="current-password" required>
+</div>
+<div class="btn-row">
+<button class="btn btn-primary" type="submit">Sign In</button>
+</div>
+</form>
+</div>
+</div>
+</body>
+</html>
