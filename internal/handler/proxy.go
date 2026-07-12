@@ -469,6 +469,15 @@ func (p *ProxyHandler) streamRawResponse(w http.ResponseWriter, resp *http.Respo
 					"bytes_sent", totalBytes.Load(),
 					"elapsed_ms", time.Since(rc.startTime).Milliseconds(),
 					"error", readErr)
+				// Close idle connections for this provider to prevent
+				// HTTP/2 connection pool poisoning. A mid-stream read error
+				// can leave the underlying HTTP/2 connection in a half-broken
+				// state; Go's http2 transport may return it to the idle pool,
+				// and the next request that reuses it stalls until the PING
+				// keepalive detects the dead connection (~30-45s). Evicting
+				// idle connections here forces a fresh connection for the
+				// next request, same as the timeout path above.
+				p.pool.CloseIdleConnections(poolKey(rc.model))
 			}
 			break
 		}

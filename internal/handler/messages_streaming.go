@@ -297,6 +297,14 @@ func (h *MessagesHandler) handleStreaming(w http.ResponseWriter, resp *http.Resp
 		}
 	}
 
+	// Check for stream read errors (non-EOF) and evict potentially
+	// poisoned HTTP/2 connections, same as the timeout path.
+	if err := scanner.Err(); err != nil {
+		slog.Error("stream interrupted (messages)",
+			"model", req.Model, "response_bytes", responseBytes, "error", err)
+		h.pool.CloseIdleConnections(poolKey(model))
+	}
+
 	// Flush any pending think-tag buffer before finalizing.
 	for _, seg := range thinkFilter.Flush() {
 		if seg.IsReasoning {

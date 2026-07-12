@@ -478,6 +478,14 @@ func (h *ResponsesHandler) handleStreaming(w http.ResponseWriter, resp *http.Res
 		}
 	}
 
+	// Check for stream read errors (non-EOF) and evict potentially
+	// poisoned HTTP/2 connections, same as the timeout path.
+	if err := scanner.Err(); err != nil {
+		slog.Error("stream interrupted (responses)",
+			"model", req.Model, "response_bytes", responseBytes, "error", err)
+		h.pool.CloseIdleConnections(poolKey(model))
+	}
+
 	// Handle search loop for streaming responses.
 	if searchEnabled && finishReason == "tool_calls" && len(toolCalls) > 0 {
 		allSearch := true
